@@ -156,8 +156,18 @@ def _require_json_string(value: object, field: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _sse_chunk(delta: str, model: str, chunk_id: str, finish_reason: str | None = None) -> bytes:
-    """Format a single OpenAI-compatible SSE chunk."""
+def _sse_delta(
+    delta: dict[str, Any],
+    model: str,
+    chunk_id: str,
+    finish_reason: str | None = None,
+) -> bytes:
+    """Format a single OpenAI-compatible SSE chunk with an arbitrary delta object.
+
+    [LOCAL PATCH] sciherd-cloud-smartagent：进度事件（深度思考 / 工具执行）经
+    ``delta.nanobot_event`` 自定义字段下发；标准 OpenAI 客户端会忽略未知
+    delta 字段，兼容性不受影响。
+    """
     payload = {
         "id": chunk_id,
         "object": "chat.completion.chunk",
@@ -166,12 +176,17 @@ def _sse_chunk(delta: str, model: str, chunk_id: str, finish_reason: str | None 
         "choices": [
             {
                 "index": 0,
-                "delta": {"content": delta} if delta else {},
+                "delta": delta,
                 "finish_reason": finish_reason,
             }
         ],
     }
-    return f"data: {_json.dumps(payload)}\n\n".encode()
+    return f"data: {_json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+
+def _sse_chunk(delta: str, model: str, chunk_id: str, finish_reason: str | None = None) -> bytes:
+    """Format a single OpenAI-compatible SSE chunk (plain-text delta)."""
+    return _sse_delta({"content": delta} if delta else {}, model, chunk_id, finish_reason)
 
 
 _SSE_DONE = b"data: [DONE]\n\n"
@@ -412,7 +427,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
         await resp.prepare(request)
 
         chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
         stream_failed = False
         emitted_content = False
 
@@ -420,7 +435,48 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
             nonlocal emitted_content
             if token:
                 emitted_content = True
-            await queue.put(token)
+            await queue.put(_sse_chunk(token, reported_model, chunk_id))
+
+        async def _on_progress(
+            content: str,
+            *,
+            tool_hint: bool = False,
+            tool_events: list[dict[str, Any]] | None = None,
+            file_edit_events: list[dict[str, Any]] | None = None,
+            reasoning: bool = False,
+            reasoning_end: bool = False,
+            **_kw: Any,
+        ) -> None:
+            # [LOCAL PATCH] 将 Agent 进度事件注入 SSE 流（delta.nanobot_event），
+            # 供客户端消息流渲染「深度思考 / 工具执行」过程时间线。
+            # tool_hint 文本行由客户端按 tool_events 自行渲染，此处不下发。
+            if reasoning and content:
+                await queue.put(
+                    _sse_delta(
+                        {"nanobot_event": {"kind": "reasoning", "content": content}},
+                        reported_model,
+                        chunk_id,
+                    )
+                )
+                return
+            if reasoning_end:
+                await queue.put(
+                    _sse_delta(
+                        {"nanobot_event": {"kind": "reasoning_end"}},
+                        reported_model,
+                        chunk_id,
+                    )
+                )
+                return
+            if tool_events:
+                for ev in tool_events:
+                    await queue.put(
+                        _sse_delta(
+                            {"nanobot_event": {"kind": "tool", **ev}},
+                            reported_model,
+                            chunk_id,
+                        )
+                    )
 
         async def _on_stream_end(*_a: Any, **_kw: Any) -> None:
             # Agent stream-end callbacks mark generation segment boundaries.
@@ -440,6 +496,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                             session_key=session_key,
                             channel="api",
                             chat_id=API_CHAT_ID,
+                            on_progress=_on_progress,
                             on_stream=_on_stream,
                             on_stream_end=_on_stream_end,
                             runtime=runtime,
@@ -448,7 +505,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                     if not emitted_content:
                         response_text = _response_text(response)
                         if response_text.strip():
-                            await queue.put(response_text)
+                            await queue.put(_sse_chunk(response_text, reported_model, chunk_id))
             except Exception:
                 stream_failed = True
                 logger.exception("Streaming error for session {}", session_key)
@@ -458,10 +515,10 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
         task = asyncio.create_task(_run())
         try:
             while True:
-                token = await queue.get()
-                if token is None:
+                chunk = await queue.get()
+                if chunk is None:
                     break
-                await resp.write(_sse_chunk(token, reported_model, chunk_id))
+                await resp.write(chunk)
         finally:
             if not task.done():
                 task.cancel()

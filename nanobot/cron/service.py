@@ -853,6 +853,26 @@ class CronService:
         store = self._require_store()
         return next((j for j in store.jobs if j.id == job_id), None)
 
+    def reload_jobs(self) -> int:
+        """Reload the job store from disk and re-arm the scheduler timer.
+
+        External writers (e.g. the desktop app merging ``jobs.json``) can
+        trigger this via the gateway's ``/v1/cron/reload`` endpoint so new
+        or changed jobs take effect immediately instead of waiting for the
+        next periodic tick (up to ``max_sleep_ms`` away).  The reload is
+        skipped while a job execution is in flight (same safety rule as
+        ``_on_timer``) and when a previous save failed to persist.
+
+        Returns:
+            Number of jobs in the (re)loaded store.
+        """
+        store = self._require_store(
+            reload_during_execution=self._active_executions == 0,
+        )
+        if self._running:
+            self._arm_timer()
+        return len(store.jobs)
+
     def status(self) -> dict[str, object]:
         """Get service status."""
         store = self._require_store()

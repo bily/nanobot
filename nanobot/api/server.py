@@ -18,6 +18,11 @@ from aiohttp import web
 from loguru import logger
 
 from nanobot.config.paths import get_media_dir
+from nanobot.security.workspace_access import (
+    WORKSPACE_SCOPE_METADATA_KEY,
+    WorkspaceScopeError,
+    validate_workspace_scope_payload,
+)
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.media_decode import (
     MAX_FILE_SIZE,
@@ -235,13 +240,20 @@ def _parse_json_content(body: dict[str, Any]) -> tuple[str, list[str]]:
     return text, media_paths
 
 
-async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | None, str | None]:
-    """Parse multipart/form-data. Returns (text, media_paths, session_id, model)."""
+async def _parse_multipart(
+    request: web.Request,
+) -> tuple[str, list[str], str | None, str | None, str | None, str | None]:
+    """Parse multipart/form-data.
+
+    Returns (text, media_paths, session_id, model, workspace, access_mode).
+    """
     media_dir = get_media_dir("api")
     reader = await request.multipart()
     text = ""
     session_id = None
     model = None
+    workspace = None
+    access_mode = None
     media_paths: list[str] = []
 
     while True:
@@ -254,6 +266,10 @@ async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | 
             session_id = (await part.read()).decode("utf-8").strip()
         elif part.name == "model":
             model = (await part.read()).decode("utf-8").strip()
+        elif part.name == "workspace":
+            workspace = (await part.read()).decode("utf-8").strip() or None
+        elif part.name == "access_mode":
+            access_mode = (await part.read()).decode("utf-8").strip() or None
         elif part.name == "files":
             raw = await part.read()
             if len(raw) > MAX_FILE_SIZE:
@@ -269,7 +285,7 @@ async def _parse_multipart(request: web.Request) -> tuple[str, list[str], str | 
     if not text:
         text = "请分析上传的文件"
 
-    return text, media_paths, session_id, model
+    return text, media_paths, session_id, model, workspace, access_mode
 
 
 # ---------------------------------------------------------------------------
@@ -291,9 +307,18 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
     model_name: str = _app_value(request.app, _MODEL_NAME_KEY, "model_name", "nanobot")
 
     stream = False
+    workspace: str | None = None
+    access_mode: str | None = None
     try:
         if content_type.startswith("multipart/"):
-            text, media_paths, session_id, requested_model = await _parse_multipart(request)
+            (
+                text,
+                media_paths,
+                session_id,
+                requested_model,
+                workspace,
+                access_mode,
+            ) = await _parse_multipart(request)
         else:
             try:
                 body = await request.json()
@@ -306,6 +331,13 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
             requested_model = body.get("model")
             text, media_paths = _parse_json_content(body)
             session_id = body.get("session_id")
+            # [LOCAL PATCH] 会话级工作空间 / 权限（客户端按会话选择后透传）
+            raw_workspace = body.get("workspace")
+            if isinstance(raw_workspace, str) and raw_workspace.strip():
+                workspace = raw_workspace.strip()
+            raw_mode = body.get("access_mode")
+            if isinstance(raw_mode, str) and raw_mode.strip():
+                access_mode = raw_mode.strip()
     except ValueError as e:
         return _error_json(400, str(e))
     except _FileSizeExceeded as e:
@@ -314,8 +346,50 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
         logger.exception("Error parsing upload")
         return _error_json(413, "File too large or invalid upload")
 
-    if requested_model and requested_model != model_name:
-        return _error_json(400, f"Only configured model '{model_name}' is available")
+    # [LOCAL PATCH] 请求级 workspace scope 预校验：非法路径直接 400，
+    # 合法则注入消息 metadata，由 WorkspaceScopeResolver 在 turn 边界生效。
+    request_metadata: dict[str, Any] | None = None
+    if workspace or access_mode:
+        resolver = getattr(agent_loop, "workspace_scopes", None)
+        if resolver is not None:
+            scope_payload: dict[str, Any] = {}
+            if workspace:
+                scope_payload["project_path"] = workspace
+            if access_mode:
+                scope_payload["access_mode"] = access_mode
+            try:
+                validate_workspace_scope_payload(
+                    scope_payload,
+                    default_workspace=resolver.default_workspace,
+                    default_restrict_to_workspace=resolver.default_restrict_to_workspace,
+                )
+            except WorkspaceScopeError as e:
+                return _error_json(400, f"Invalid workspace scope: {e}")
+            request_metadata = {WORKSPACE_SCOPE_METADATA_KEY: scope_payload}
+
+    # [LOCAL PATCH] 请求级模型解析：preset 名走配置预设，裸模型名走当前 provider 覆盖；
+    # 仅作用于本次请求，不改动网关默认选择。空值跟随配置默认。
+    runtime = None
+    reported_model = model_name
+    if requested_model:
+        resolver = getattr(agent_loop, "runtime_resolver", None)
+        presets = getattr(agent_loop, "model_presets", None) or {}
+        if resolver is not None:
+            try:
+                if requested_model in presets:
+                    runtime = resolver.resolve_preset(requested_model)
+                else:
+                    runtime = resolver.resolve_override(
+                        model=requested_model, model_preset=None
+                    )
+            except (KeyError, ValueError):
+                available = ", ".join(presets) or model_name
+                return _error_json(
+                    400, f"Unknown model '{requested_model}'. Available: {available}"
+                )
+        elif requested_model != model_name:
+            return _error_json(400, f"Only configured model '{model_name}' is available")
+        reported_model = runtime.model if runtime is not None else requested_model
 
     session_key = f"api:{session_id}" if session_id else API_SESSION_KEY
     session_locks: dict[str, asyncio.Lock] = _app_value(
@@ -368,6 +442,8 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                             chat_id=API_CHAT_ID,
                             on_stream=_on_stream,
                             on_stream_end=_on_stream_end,
+                            runtime=runtime,
+                            metadata=request_metadata,
                         )
                     if not emitted_content:
                         response_text = _response_text(response)
@@ -385,7 +461,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                 token = await queue.get()
                 if token is None:
                     break
-                await resp.write(_sse_chunk(token, model_name, chunk_id))
+                await resp.write(_sse_chunk(token, reported_model, chunk_id))
         finally:
             if not task.done():
                 task.cancel()
@@ -393,7 +469,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                     await task
 
         if not stream_failed:
-            await resp.write(_sse_chunk("", model_name, chunk_id, finish_reason="stop"))
+            await resp.write(_sse_chunk("", reported_model, chunk_id, finish_reason="stop"))
             await resp.write(_SSE_DONE)
         return resp
 
@@ -409,6 +485,8 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                         session_key=session_key,
                         channel="api",
                         chat_id=API_CHAT_ID,
+                        runtime=runtime,
+                        metadata=request_metadata,
                     )
                 response_text = _response_text(response)
                 if not response_text or not response_text.strip():
@@ -425,26 +503,50 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
         return _error_json(500, "Internal server error", err_type="server_error")
 
     return web.json_response(
-        _chat_completion_response(response_text, model_name, getattr(agent_loop, "_last_usage", None))
+        _chat_completion_response(response_text, reported_model, getattr(agent_loop, "_last_usage", None))
     )
 
 
 async def handle_models(request: web.Request) -> web.Response:
-    """GET /v1/models"""
+    """GET /v1/models
+
+    [LOCAL PATCH] sciherd-cloud-smartagent：模型列表来源由「单一默认模型」
+    扩展为 nanobot 配置中的模型预设目录（modelPresets + 隐式 default），
+    供前端模型选择器动态渲染；default 始终位于首位。
+    """
     model_name = _app_value(request.app, _MODEL_NAME_KEY, "model_name", "nanobot")
-    return web.json_response(
-        {
-            "object": "list",
-            "data": [
+    agent_loop = _app_value(request.app, _AGENT_LOOP_KEY, "agent_loop", None)
+
+    data: list[dict[str, Any]] = []
+    presets = getattr(agent_loop, "model_presets", None) if agent_loop is not None else None
+    if presets:
+        for name, preset in presets.items():
+            # default 为隐式预设（无 label 配置），以实际模型名作为展示名
+            fallback_label = name if name != "default" else getattr(preset, "model", name)
+            label = getattr(preset, "label", None) or fallback_label
+            data.append(
                 {
-                    "id": model_name,
+                    "id": name,
+                    "label": label,
+                    "model": getattr(preset, "model", name),
                     "object": "model",
                     "created": 0,
                     "owned_by": "nanobot",
                 }
-            ],
-        }
-    )
+            )
+        # default（agents.defaults 隐式预设）固定置顶
+        data.sort(key=lambda item: (item["id"] != "default", item["id"]))
+    else:
+        data.append(
+            {
+                "id": model_name,
+                "object": "model",
+                "created": 0,
+                "owned_by": "nanobot",
+            }
+        )
+
+    return web.json_response({"object": "list", "data": data})
 
 
 async def handle_health(request: web.Request) -> web.Response:

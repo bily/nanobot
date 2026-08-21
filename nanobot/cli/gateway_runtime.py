@@ -216,6 +216,9 @@ def _pick_heartbeat_target_from_sessions(
 
 _GATEWAY_HEALTH_MAX_CONNECTIONS = 64
 _GATEWAY_HEALTH_READ_TIMEOUT_SECONDS = 2.0
+# /v1/send 请求体上限：出站消息为纯文本，1 MiB 足够且防滥用
+_GATEWAY_HEALTH_MAX_HEADER_BYTES = 64 * 1024
+_GATEWAY_HEALTH_MAX_BODY_BYTES = 1024 * 1024
 
 
 def _print_gateway_health_endpoint(host: str, port: int) -> None:
@@ -721,10 +724,111 @@ def _run_gateway(
         console.print("[yellow]✗[/yellow] Heartbeat: disabled")
 
     async def _health_server(host: str, health_port: int) -> None:
-        """Lightweight HTTP health endpoint on the gateway port."""
+        """Lightweight HTTP endpoint on the gateway port.
+
+        Routes:
+        - GET  /health          → liveness probe;
+        - POST /v1/send         → outbound delivery: push a message from the agent
+          side to a bound IM chat (e.g. Feishu) and mirror it into that
+          channel's session history. Body: {"channel","chat_id","content"}.
+        - POST /v1/cron/reload  → reload the cron job store from disk and
+          re-arm the scheduler, so jobs merged into ``jobs.json`` by the
+          desktop app take effect immediately (no gateway restart needed).
+        """
         import json as _json
 
         connection_slots = asyncio.Semaphore(_GATEWAY_HEALTH_MAX_CONNECTIONS)
+
+        async def _read_request(
+            reader: asyncio.StreamReader,
+        ) -> tuple[str, str, bytes]:
+            """Parse method / path / body from a raw HTTP/1.x request."""
+            header = b""
+            while b"\r\n\r\n" not in header:
+                chunk = await asyncio.wait_for(
+                    reader.read(4096),
+                    timeout=_GATEWAY_HEALTH_READ_TIMEOUT_SECONDS,
+                )
+                if not chunk:
+                    break
+                header += chunk
+                if len(header) > _GATEWAY_HEALTH_MAX_HEADER_BYTES:
+                    break
+            head, _, body = header.partition(b"\r\n\r\n")
+            lines = head.decode("utf-8", errors="replace").split("\r\n")
+            parts = (lines[0] if lines else "").split(" ")
+            method, path = (parts[0], parts[1]) if len(parts) >= 2 else ("", "")
+            content_length = 0
+            for line in lines[1:]:
+                if line.lower().startswith("content-length:"):
+                    try:
+                        content_length = int(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        content_length = 0
+            content_length = min(content_length, _GATEWAY_HEALTH_MAX_BODY_BYTES)
+            while len(body) < content_length:
+                chunk = await asyncio.wait_for(
+                    reader.read(min(65536, content_length - len(body))),
+                    timeout=_GATEWAY_HEALTH_READ_TIMEOUT_SECONDS,
+                )
+                if not chunk:
+                    break
+                body += chunk
+            return method, path, body[:content_length]
+
+        async def _write_response(
+            writer: asyncio.StreamWriter,
+            status: str,
+            payload: dict[str, object],
+        ) -> None:
+            body = _json.dumps(payload).encode("utf-8")
+            writer.write(
+                (
+                    f"HTTP/1.0 {status}\r\n"
+                    "Content-Type: application/json\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                ).encode("utf-8") + body
+            )
+            await writer.drain()
+
+        async def _handle_send(body: bytes) -> tuple[str, dict[str, object]]:
+            """Validate and deliver one outbound message to its IM channel."""
+            try:
+                data = _json.loads(body.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return "400 Bad Request", {"ok": False, "error": "invalid json body"}
+            channel = str(data.get("channel") or "").strip()
+            chat_id = str(data.get("chat_id") or "").strip()
+            content = str(data.get("content") or "").strip()
+            if not channel or not chat_id or not content:
+                return "400 Bad Request", {
+                    "ok": False,
+                    "error": "channel, chat_id and content are required",
+                }
+            if channels.get_channel(channel) is None:
+                return "409 Conflict", {
+                    "ok": False,
+                    "error": f"channel is not enabled: {channel}",
+                }
+            await _deliver_to_channel(
+                OutboundMessage(channel=channel, chat_id=chat_id, content=content),
+                record=True,
+            )
+            return "200 OK", {"ok": True}
+
+        async def _handle_cron_reload() -> tuple[str, dict[str, object]]:
+            """Reload cron jobs from disk so external edits take effect now."""
+            try:
+                job_count = cron.reload_jobs()
+            except Exception as exc:
+                logger.exception("Gateway /v1/cron/reload failed: {}", exc)
+                return "500 Internal Server Error", {
+                    "ok": False,
+                    "error": str(exc),
+                }
+            return "200 OK", {"ok": True, "jobs": job_count}
 
         async def handle(
             reader: asyncio.StreamReader,
@@ -736,38 +840,32 @@ def _run_gateway(
 
             async with connection_slots:
                 try:
-                    data = await asyncio.wait_for(
-                        reader.read(4096),
-                        timeout=_GATEWAY_HEALTH_READ_TIMEOUT_SECONDS,
-                    )
-                    request_line = data.split(b"\r\n", 1)[0].decode(
-                        "utf-8", errors="replace",
-                    )
-                    method, path = "", ""
-                    parts = request_line.split(" ")
-                    if len(parts) >= 2:
-                        method, path = parts[0], parts[1]
+                    method, path, body = await _read_request(reader)
 
                     if method == "GET" and path == "/health":
-                        body = _json.dumps({"status": "ok"})
-                        status = "200 OK"
-                        content_type = "application/json"
+                        await _write_response(writer, "200 OK", {"status": "ok"})
+                    elif method == "POST" and path == "/v1/send":
+                        status, payload = await _handle_send(body)
+                        await _write_response(writer, status, payload)
+                    elif method == "POST" and path == "/v1/cron/reload":
+                        status, payload = await _handle_cron_reload()
+                        await _write_response(writer, status, payload)
                     else:
-                        body = "Not Found"
-                        status = "404 Not Found"
-                        content_type = "text/plain"
-
-                    resp = (
-                        f"HTTP/1.0 {status}\r\n"
-                        f"Content-Type: {content_type}\r\n"
-                        f"Content-Length: {len(body)}\r\n"
-                        "Connection: close\r\n"
-                        f"\r\n{body}"
-                    )
-                    writer.write(resp.encode())
-                    await writer.drain()
+                        await _write_response(
+                            writer, "404 Not Found", {"error": "not found"},
+                        )
                 except (asyncio.TimeoutError, ConnectionError):
                     pass
+                except Exception as exc:  # keep the health server alive
+                    logger.exception("Gateway /v1/send failed: {}", exc)
+                    try:
+                        await _write_response(
+                            writer,
+                            "500 Internal Server Error",
+                            {"ok": False, "error": str(exc)},
+                        )
+                    except Exception:
+                        pass
                 finally:
                     writer.close()
 

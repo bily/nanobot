@@ -112,7 +112,9 @@ class WorkspaceScopeResolver:
 
     default_workspace: str | Path
     default_restrict_to_workspace: bool
-    scoped_channel: str = "websocket"
+    # [LOCAL PATCH] 允许携带会话级 workspace scope 的渠道集合：
+    # websocket（WebUI 原有）+ api（本客户端按会话选择工作空间/权限）。
+    scoped_channels: frozenset[str] = frozenset({"websocket", "api"})
 
     @property
     def sandbox_status(self) -> WorkspaceSandboxStatus:
@@ -142,7 +144,7 @@ class WorkspaceScopeResolver:
         message_metadata: Any,
         session_metadata: Any,
     ) -> WorkspaceScope:
-        if channel != self.scoped_channel:
+        if channel not in self.scoped_channels:
             return self.default()
         return resolve_effective_workspace_scope(
             message_metadata=message_metadata,
@@ -153,7 +155,7 @@ class WorkspaceScopeResolver:
         )
 
     def persist_message_scope(self, session: Any, msg: Any) -> None:
-        if getattr(msg, "channel", None) != self.scoped_channel:
+        if getattr(msg, "channel", None) not in self.scoped_channels:
             return
         metadata = getattr(msg, "metadata", None)
         if not isinstance(metadata, dict):

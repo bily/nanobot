@@ -897,6 +897,8 @@ class OpenAICompatProvider(LLMProvider):
         temperature: float,
         reasoning_effort: str | None,
         tool_choice: str | dict[str, Any] | None,
+        *,
+        streaming: bool = True,
     ) -> dict[str, Any]:
         model_name = model or self.default_model
         spec = self._spec
@@ -1024,6 +1026,15 @@ class OpenAICompatProvider(LLMProvider):
             # Xiaomi's API accepts both params.
             if slug in _KIMI_THINKING_MODELS:
                 kwargs.pop("reasoning_effort", None)
+
+        # DashScope / ModelScope thinking models default to enable_thinking=true,
+        # but their OpenAI-compatible endpoints reject non-streaming requests
+        # that leave thinking on ("parameter.enable_thinking must be set to
+        # false for non-streaming calls").  Cron jobs and any other
+        # non-streaming turn must therefore force it off explicitly,
+        # regardless of the reasoning_effort handling above.
+        if not streaming and spec and spec.thinking_style == "enable_thinking":
+            kwargs.setdefault("extra_body", {})["enable_thinking"] = False
 
         if tools:
             kwargs["tools"] = tools
@@ -1936,6 +1947,7 @@ class OpenAICompatProvider(LLMProvider):
             kwargs = self._build_kwargs(
                 messages, tools, model, max_tokens, temperature,
                 reasoning_effort, tool_choice,
+                streaming=False,
             )
             chat_raw = cast(
                 Any,

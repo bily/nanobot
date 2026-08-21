@@ -2358,16 +2358,19 @@ class AgentLoop:
         runtime: LLMRuntime | None = None,
         on_runtime_admitted: Callable[[LLMRuntime], Awaitable[None]] | None = None,
         attributes: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> OutboundMessage | None:
         """Process an external message directly and return the outbound payload."""
         if channel == "system":
             raise ValueError("channel 'system' is reserved for internal messages")
-        metadata: dict[str, Any] = {}
+        # [LOCAL PATCH] 允许调用方注入消息级 metadata（如 workspace_scope），
+        # 使 /v1 等直连入口可携带会话级工作空间/权限策略。
+        merged_metadata: dict[str, Any] = dict(metadata or {})
         if not persist_user_message:
-            metadata[turn_continuation.SKIP_USER_PERSIST_META] = True
+            merged_metadata[turn_continuation.SKIP_USER_PERSIST_META] = True
         msg = InboundMessage(
             channel=channel, sender_id=sender_id, chat_id=chat_id,
-            content=content, media=media or [], metadata=metadata,
+            content=content, media=media or [], metadata=merged_metadata,
         )
         # Share the dispatch lock so direct calls serialize with bus turns.
         lock = self._get_session_lock(session_key)

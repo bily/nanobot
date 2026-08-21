@@ -94,7 +94,6 @@ interface AppOptions {
   version: string
   access: string
   theme: "auto" | ThemeMode
-  onExit?: (chatId: string) => void
 }
 
 interface ChatClient {
@@ -259,6 +258,7 @@ function runtimeControlsTheme(palette: Palette) {
 function contextPanelTheme(palette: Palette): ContextPanelTheme {
   return {
     text: palette.text,
+    muted: palette.muted,
     border: palette.border,
     accent: palette.accent,
   }
@@ -335,11 +335,6 @@ function formatElapsed(milliseconds: number): string {
 
 function singleLine(value: string, limit = 120): string {
   return value.replace(/\s+/gu, " ").trim().slice(0, limit)
-}
-
-export function sessionExitMessage(chatId: string): string {
-  const sessionId = `websocket:${chatId}`
-  return `Resume with: nanobot agent --session ${sessionId}\n`
 }
 
 async function copyWithSystemClipboard(text: string): Promise<void> {
@@ -2318,8 +2313,6 @@ export class NanobotTui {
     this.host.release()
     this.client.close()
     this.renderer.destroy()
-    const chatId = this.client.activeChatId || this.options.chatId
-    if (chatId) this.options.onExit?.(chatId)
   }
 
   private handleDestroy = (): void => {

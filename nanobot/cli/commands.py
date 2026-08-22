@@ -333,6 +333,7 @@ def serve(
 
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
+    from nanobot.cron.service import CronService
     from nanobot.providers.image_generation import image_gen_provider_configs
     from nanobot.session.manager import SessionManager
 
@@ -353,6 +354,17 @@ def serve(
     sync_workspace_templates(runtime_config.workspace_path)
     bus = MessageBus()
     session_manager = SessionManager(runtime_config.workspace_path)
+    # [LOCAL PATCH] sciherd-cloud-smartagent：为 serve 进程注入 CronService，
+    # 解锁聊天链路中的内置 cron 工具（CronTool 的 enabled 条件为
+    # ctx.cron_service is not None），使用户可通过 /v1 聊天创建定时任务。
+    #
+    # 注意：绝不在此处调用 cron.start()。调度循环由 gateway 进程独占
+    # （见 gateway_runtime.py），双循环会导致任务重复执行。本实例未 start，
+    # add_job 仅通过 action.jsonl 追加写盘（见 cron/service.py 的
+    # _append_action），运行中的 gateway 实例会通过 _merge_action 自动吸收
+    # 这些写盘动作，因此 serve 进程只负责「记录意图」，不参与调度。
+    # 未 start 的 CronService 不持有定时器/文件锁等资源，进程退出无需清理。
+    cron = CronService(runtime_config.workspace_path / "cron" / "jobs.json")
     tools = ToolRegistry()
     mcp_provider = MCPProvider.from_config(runtime_config, tools)
     try:
@@ -362,6 +374,7 @@ def serve(
             image_generation_provider_configs=image_gen_provider_configs(runtime_config),
             hook_factories=[create_file_edit_activity_hook],
             tool_registry=tools,
+            cron_service=cron,
         )
     except ValueError as exc:
         console.print(f"[red]Error: {exc}[/red]")

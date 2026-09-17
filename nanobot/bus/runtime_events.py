@@ -10,13 +10,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from nanobot.bus.events import InboundMessage
+from nanobot.providers.base import LLMUsage
 
 if TYPE_CHECKING:
     from nanobot.utils.llm_runtime import LLMRuntime
@@ -72,7 +73,9 @@ class TurnCompleted:
     context: RuntimeEventContext
     latency_ms: int | None = None
     runtime: LLMRuntime | None = None
-    usage: dict[str, int] = field(default_factory=dict)
+    usage: LLMUsage | None = None
+    # Logical model rounds in display order; recovery dispatches are aggregated.
+    round_usages: tuple[LLMUsage, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -180,7 +183,8 @@ class RuntimeEventPublisher:
         self.bus = bus or RuntimeEventBus()
         self._turn_latency_ms: dict[str, int] = {}
         self._turn_runtime: dict[str, LLMRuntime] = {}
-        self._turn_usage: dict[str, dict[str, int]] = {}
+        self._turn_usage: dict[str, LLMUsage] = {}
+        self._turn_round_usages: dict[str, tuple[LLMUsage, ...]] = {}
 
     @staticmethod
     def _context(
@@ -206,17 +210,29 @@ class RuntimeEventPublisher:
         if latency_ms is not None:
             self._turn_latency_ms[session_key] = int(latency_ms)
 
-    def record_turn_usage(self, session_key: str, usage: Mapping[str, int]) -> None:
-        self._turn_usage[session_key] = {
-            key: int(value)
-            for key, value in usage.items()
-            if type(value) is int and value >= 0
-        }
+    def record_turn_usage(
+        self,
+        session_key: str,
+        round_usages: list[LLMUsage],
+    ) -> None:
+        if not round_usages:
+            return
+
+        usage = round_usages[0]
+        for round_usage in round_usages[1:]:
+            usage += round_usage
+        previous = self._turn_usage.get(session_key)
+        self._turn_usage[session_key] = usage if previous is None else previous + usage
+        self._turn_round_usages[session_key] = (
+            *self._turn_round_usages.get(session_key, ()),
+            *round_usages,
+        )
 
     def clear_turn(self, session_key: str) -> None:
         self._turn_latency_ms.pop(session_key, None)
         self._turn_runtime.pop(session_key, None)
         self._turn_usage.pop(session_key, None)
+        self._turn_round_usages.pop(session_key, None)
 
     async def user_input_accepted(
         self,
@@ -332,7 +348,8 @@ class RuntimeEventPublisher:
                 ),
                 latency_ms=self._turn_latency_ms.pop(session_key, None),
                 runtime=self._turn_runtime.pop(session_key, None),
-                usage=self._turn_usage.pop(session_key, {}),
+                usage=self._turn_usage.pop(session_key, None),
+                round_usages=self._turn_round_usages.pop(session_key, ()),
             )
         )
 

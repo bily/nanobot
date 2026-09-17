@@ -20,6 +20,16 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 from nanobot.config_base import Base
+from nanobot.security.trash import (
+    DEFAULT_BULK_THRESHOLD,
+    TRASH_UNAVAILABLE_NOTE,
+    BulkDeleteError,
+    TrashError,
+    append_delete_report,
+    check_bulk_threshold,
+    delete_path,
+    delete_report_line,
+)
 from nanobot.security.workspace_access import current_tool_workspace
 from nanobot.utils.helpers import build_image_content_blocks, detect_image_mime
 
@@ -28,6 +38,20 @@ class FileToolsConfig(Base):
     """Filesystem tools configuration."""
 
     enable: bool = True  # built-in file tools on by default
+    #: [LOCAL PATCH] nanowork FR-8.4「默认拒绝写入」。
+    #: 为 True 时，**没有配置任何可写白名单**的作用域（即 `full` 访问模式）
+    #: 一律拒绝写操作，而不是退化成「哪里都能写」。默认 False 保持引擎上游
+    #: 语义不变；nanowork 客户端显式打开。
+    default_deny_write: bool = False
+    #: [LOCAL PATCH] nanowork FR-8.3「删除留痕」。
+    #: 每次删除追加一行 JSON 到该文件（对齐 WorkBuddy 的
+    #: `safe-delete-report.ndjson`）。留空表示由 `create()` 落到
+    #: `<workspace>/safe-delete-report.ndjson`；显式写 `off` 可关闭留痕。
+    safe_delete_report_path: str = ""
+    #: [LOCAL PATCH] nanowork FR-8.3「批量删除守卫」。
+    #: 单次删除超过该条目数时要求显式 `confirm=true`（对齐 WorkBuddy
+    #: `safe-delete-bulk-guard.cjs` 的默认阈值）。<=0 表示关闭守卫。
+    safe_delete_bulk_threshold: int = DEFAULT_BULK_THRESHOLD
 
 
 class _FsTool(Tool):
@@ -55,9 +79,21 @@ class _FsTool(Tool):
         restrict_to_workspace: bool | None = None,
         sandbox_restricts_workspace: bool = False,
         extra_read_allowed_files: list[Path] | None = None,
+        default_deny_write: bool = False,
+        safe_delete_report_path: str = "",
+        safe_delete_bulk_threshold: int = DEFAULT_BULK_THRESHOLD,
+        user_plugins_dir: Path | None = None,
     ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
+        # [LOCAL PATCH] FR-3.4：用户级插件目录。必须与 SkillsLoader 同一个来源，
+        # 否则缓存 key 不一致会重复扫描（见 ToolContext.user_plugins_dir 的说明）。
+        self._user_plugins_dir = user_plugins_dir
+        # [LOCAL PATCH] nanowork FR-8.4：写操作的默认策略（无白名单即拒绝）。
+        self._default_deny_write = bool(default_deny_write)
+        # [LOCAL PATCH] nanowork FR-8.3：删除留痕与批量守卫。
+        self._safe_delete_report_path = safe_delete_report_path
+        self._safe_delete_bulk_threshold = int(safe_delete_bulk_threshold)
         # Legacy alias: extra_allowed_dirs is read-only. Write-capable tools
         # must opt in via extra_write_allowed_dirs.
         self._extra_read_allowed_dirs = [
@@ -93,6 +129,16 @@ class _FsTool(Tool):
         allowed_dir = agent_workspace if restrict else None
         # Agent-owned skills stay available from project scopes. History is a narrower
         # capability: expose only the append-only log, not the surrounding memory directory.
+        # [LOCAL PATCH] nanowork FR-8.3：留痕默认落到工作区根，配置可覆盖 / 关闭。
+        report_config = str(
+            getattr(ctx.config.file, "safe_delete_report_path", "") or ""
+        )
+        if report_config.lower() in {"off", "none", "disabled"}:
+            report_path = ""
+        elif report_config:
+            report_path = report_config
+        else:
+            report_path = str(resolved_agent_workspace / "safe-delete-report.ndjson")
         return cls(
             workspace=agent_workspace,
             allowed_dir=allowed_dir,
@@ -101,6 +147,17 @@ class _FsTool(Tool):
             file_states=ctx.file_state_store,
             restrict_to_workspace=ctx.config.restrict_to_workspace,
             sandbox_restricts_workspace=sandbox_restricts,
+            default_deny_write=getattr(ctx.config.file, "default_deny_write", False),
+            safe_delete_report_path=report_path,
+            safe_delete_bulk_threshold=int(
+                getattr(
+                    ctx.config.file,
+                    "safe_delete_bulk_threshold",
+                    DEFAULT_BULK_THRESHOLD,
+                )
+            ),
+            # [LOCAL PATCH] FR-3.4：与 SkillsLoader 共用同一个用户级插件目录。
+            user_plugins_dir=ctx.user_plugins_dir,
         )
 
     @property
@@ -129,6 +186,7 @@ class _FsTool(Tool):
         *,
         include_media_dir: bool,
         extra_files_require_allowed_root: bool = False,
+        write: bool = False,
     ) -> Path:
         access = current_tool_workspace(
             self._workspace,
@@ -145,6 +203,8 @@ class _FsTool(Tool):
             extra_allowed_dirs,
             extra_allowed_files,
             include_media_dir=include_media_dir,
+            write=write,
+            deny_write_by_default=self._default_deny_write,
         )
 
     def _resolve_read(self, path: str) -> Path:
@@ -166,6 +226,14 @@ class _FsTool(Tool):
                         enabled_agent_plugin_skill_dirs(
                             Path(self._workspace),
                             requested_path=candidate.resolve(strict=False),
+                            # [LOCAL PATCH] FR-3.4：用户级插件的技能也必须可读。
+                            # 少了这个参数，用户级插件里的技能会出现在提示词清单里
+                            # 却在 read_file 时被判越权——「看得见、读不到」。
+                            #
+                            # 值来自 ToolContext（与 SkillsLoader 同源），**不要**在
+                            # 这里现算 default_user_plugins_dir()：那会让缓存 key 与
+                            # 预热时不一致，同一份包被扫两遍。
+                            user_plugins_dir=self._user_plugins_dir,
                         )
                     )
             except (OSError, RuntimeError):
@@ -184,6 +252,7 @@ class _FsTool(Tool):
             self._extra_write_allowed_dirs,
             self._extra_write_allowed_files,
             include_media_dir=False,
+            write=True,
         )
 
     def _resolve(self, path: str) -> Path:
@@ -251,16 +320,16 @@ def _builtin_skill_read_path(path: str) -> Path | None:
     tool_parameters_schema(
         path=StringSchema("The file path to read"),
         offset=IntegerSchema(
-            description="Line number to start reading from (1-indexed, default 1)",
+            description="1-based text or extracted-document line (default 1)",
             minimum=1,
         ),
         limit=IntegerSchema(
-            description="Maximum number of lines to read (default 2000)",
+            description="Maximum lines to return (default 2000)",
             minimum=1,
         ),
-        pages=StringSchema("Page range for PDF files, e.g. '1-5' (default: all, max 20 pages)"),
+        pages=StringSchema("PDF page number or range, e.g. '7' or '1-5' (max 20 pages)"),
         force=BooleanSchema(
-            description="Bypass same-file read deduplication and return content again.",
+            description="Return an unchanged range again",
             default=False,
         ),
         required=["path"],
@@ -282,18 +351,8 @@ class ReadFileTool(_FsTool):
     @property
     def description(self) -> str:
         return (
-            "Read a file (text, image, or document). "
-            "Text output format: LINE_NUM|CONTENT. "
-            "Images return visual content for analysis. "
-            "Supports PDF, DOCX, XLSX, PPTX documents. "
-            "Uploaded non-image attachments are referenced by path; read them "
-            "with this tool only when their contents are needed. "
-            "Use find_files/list_dir first when the path is uncertain. "
-            "Read the relevant range before editing so replacements or patches "
-            "are based on current content. "
-            "Use offset and limit for large text files. "
-            "Use force=true to re-read content even if unchanged. "
-            "Reads exceeding ~128K chars are truncated."
+            "Read text, images, PDFs, and Office documents by path. "
+            "Text is line-numbered; use offset/limit or pages for targeted ranges."
         )
 
     @property
@@ -342,7 +401,7 @@ class ReadFileTool(_FsTool):
 
             # Office document support
             if fp.suffix.lower() in {".docx", ".xlsx", ".pptx"}:
-                return self._read_office_doc(fp)
+                return self._read_office_doc(fp, offset, limit)
 
             raw = fp.read_bytes()
             if not raw:
@@ -464,8 +523,8 @@ class ReadFileTool(_FsTool):
                 max_pages=self._MAX_PDF_PAGES,
                 max_chars=self._MAX_CHARS,
             )
-        except PdfPageRangeError:
-            return ToolResult.error(f"Error: Invalid page range '{pages}'. Use format like '1-5'.")
+        except PdfPageRangeError as e:
+            return ToolResult.error(f"Error: Invalid page range '{pages}': {e!s}.")
         except PdfSafetyError as e:
             return ToolResult.error(f"Error reading PDF: {e}")
         except Exception as e:
@@ -484,24 +543,85 @@ class ReadFileTool(_FsTool):
             )
         return result
 
-    def _read_office_doc(self, fp: Path) -> str:
-        from nanobot.utils.document import extract_text
+    def _read_office_doc(
+        self,
+        fp: Path,
+        offset: int,
+        limit: int | None,
+    ) -> str:
+        from nanobot.utils.document import open_document_line_source
 
-        result = extract_text(fp)
+        offset = max(1, offset)
+        requested_limit = limit or self._DEFAULT_LIMIT
+        source_iterator = None
+        try:
+            source = open_document_line_source(fp)
+            if source is None:
+                return ToolResult.error(f"Error: Unsupported file format: {fp.suffix}")
+            source_iterator = source.lines
+            numbered: list[str] = []
+            output_chars = 0
+            total_seen = 0
+            end = offset - 1
+            has_more = False
+            line_was_clipped = False
 
-        if result is None:
-            return ToolResult.error(f"Error: Unsupported file format: {fp.suffix}")
+            for line in source_iterator:
+                total_seen = line.extracted_line
+                if line.extracted_line < offset:
+                    continue
+                if len(numbered) >= requested_limit:
+                    has_more = True
+                    break
 
-        if result.startswith("[error:"):
-            return ToolResult.error(f"Error reading {fp.suffix.upper()} file: {result}")
+                rendered = f"{line.extracted_line}| {line.text}"
+                extra = 1 if numbered else 0
+                if output_chars + extra + len(rendered) > self._MAX_CHARS:
+                    if numbered:
+                        has_more = True
+                        break
+                    prefix = f"{line.extracted_line}| "
+                    available = max(0, self._MAX_CHARS - len(prefix) - 3)
+                    rendered = f"{prefix}{line.text[:available]}..."
+                    line_was_clipped = True
+                    has_more = True
+                numbered.append(rendered)
+                output_chars += extra + len(rendered)
+                end = line.extracted_line
+                if line_was_clipped:
+                    break
 
-        if not result:
-            return f"({fp.suffix.upper().lstrip('.')} has no extractable text: {fp})"
+            if not numbered:
+                if total_seen == 0:
+                    return (
+                        f"({fp.suffix.upper().lstrip('.')} has no extractable text: {fp})"
+                    )
+                return ToolResult.error(
+                    f"Error: offset {offset} is beyond end of extracted document "
+                    f"({total_seen} lines)"
+                )
 
-        if len(result) > self._MAX_CHARS:
-            result = result[:self._MAX_CHARS] + "\n\n(Document text truncated at ~128K chars)"
-
-        return result
+            output = "\n".join(numbered)
+            if has_more:
+                if line_was_clipped:
+                    output += (
+                        "\n\n(Document text truncated at ~128K chars; line clipped. "
+                        f"Use offset={end + 1} to continue.)"
+                    )
+                else:
+                    output += (
+                        f"\n\n(Showing extracted lines {offset}-{end}. "
+                        f"Use offset={end + 1} to continue.)"
+                    )
+            else:
+                output += f"\n\n(End of document — {total_seen} extracted lines total)"
+            return output
+        except Exception as e:
+            return ToolResult.error(f"Error reading {fp.suffix.upper()} file: {e!s}")
+        finally:
+            close = getattr(source_iterator, "close", None)
+            if close is not None:
+                close()
 
 
 # ---------------------------------------------------------------------------
@@ -810,8 +930,10 @@ def _best_window(old_text: str, content: str) -> tuple[float, int, list[str], li
 @tool_parameters(
     tool_parameters_schema(
         path=StringSchema("The file path to edit"),
-        old_text=StringSchema("The text to find and replace"),
-        new_text=StringSchema("The text to replace with"),
+        old_text=StringSchema("The text to find and replace; copy it from read_file."),
+        new_text=StringSchema(
+            "The replacement text; must differ from old_text for an existing file."
+        ),
         replace_all=BooleanSchema(description="Replace all occurrences (default false)"),
         occurrence=IntegerSchema(
             description="Optional 1-based occurrence to replace when old_text appears multiple times.",
@@ -848,15 +970,9 @@ class EditFileTool(_FsTool):
     @property
     def description(self) -> str:
         return (
-            "Perform a small, exact replacement in one file by replacing "
-            "old_text with new_text. When replacing text in an existing file, "
-            "old_text and new_text must be different. Use this for narrow text substitutions "
-            "with old_text copied from read_file. For multi-file, structural, "
-            "or generated code edits, prefer apply_patch. If old_text matches "
-            "multiple times, provide more context or set occurrence, line_hint, "
-            "replace_all, and expected_replacements. When editing from numbered "
-            "read_file output, set line_hint to the exact target line. "
-            "Shows closest-match diagnostics on failure."
+            "Perform a small, exact replacement in one file. "
+            "Prefer apply_patch for multi-file, structural, or generated edits. "
+            "occurrence, line_hint, and replace_all=true are mutually exclusive."
         )
 
     @staticmethod
@@ -1139,3 +1255,102 @@ class ListDirTool(_FsTool):
             return ToolResult.error(f"Error: {e}")
         except Exception as e:
             return ToolResult.error(f"Error listing directory: {e}")
+
+
+# ---------------------------------------------------------------------------
+# delete_file
+# ---------------------------------------------------------------------------
+
+
+@tool_parameters(
+    tool_parameters_schema(
+        path=StringSchema("The file or directory path to delete"),
+        confirm=BooleanSchema(
+            description=(
+                "Set true to acknowledge deleting more entries than the bulk "
+                "delete threshold allows in one call"
+            )
+        ),
+        required=["path"],
+    )
+)
+class SafeDeleteTool(_FsTool):
+    """[LOCAL PATCH] nanowork FR-8.3：删除改道系统回收站，失败即 fail-closed。
+
+    这是模型唯一被允许的删除入口——``exec`` 工具里的 ``rm`` / ``del`` /
+    ``Remove-Item`` 会被 shell 守卫拦下并指回这里（见
+    ``nanobot/security/trash.py`` 与 ``shell.py::_guard_command``）。
+    """
+
+    _scopes = {"core", "subagent"}
+
+    @property
+    def name(self) -> str:
+        return "delete_file"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Delete a file or directory. Anything outside the OS temp directory "
+            "is moved to the system recycle bin so the user can restore it, and "
+            "the operation is recorded in the safe-delete report. Deleting a "
+            "non-empty directory or more entries than the bulk threshold "
+            "requires confirm=true. If no recycle bin is available the call "
+            "fails and nothing is deleted."
+        )
+
+    @property
+    def read_only(self) -> bool:
+        return False
+
+    def _report(self, *, operation: str, path: str, ok: bool, detail: str | None = None) -> None:
+        append_delete_report(
+            delete_report_line(
+                operation=operation,
+                path=path,
+                ok=ok,
+                detail=detail,
+            ),
+            report_path=self._safe_delete_report_path,
+        )
+
+    async def execute(
+        self,
+        path: str | None = None,
+        confirm: bool = False,
+        **kwargs: Any,
+    ) -> str:
+        if not path:
+            return ToolResult.error("Error: Unknown path")
+        try:
+            # 删除是写类操作：复用写解析路径，让 FR-8.4 的默认拒绝写入与
+            # 凭据 no_access 守卫同样覆盖删除（否则删除就是写策略的旁路）。
+            target = self._resolve_write(path)
+        except PermissionError as e:
+            self._report(operation="refused", path=path, ok=False, detail=str(e))
+            return ToolResult.error(f"Error: {e}")
+
+        if not target.exists() and not target.is_symlink():
+            return ToolResult.error(f"Error: Path not found: {path}")
+
+        try:
+            check_bulk_threshold(
+                target,
+                threshold=self._safe_delete_bulk_threshold,
+                confirmed=confirm,
+            )
+        except BulkDeleteError as e:
+            self._report(operation="refused", path=str(target), ok=False, detail=str(e))
+            return ToolResult.error(f"Error: {e}")
+
+        try:
+            outcome = delete_path(target)
+        except TrashError as e:
+            # fail-closed：回收站不可用时**不**降级为真删，原样报错。
+            self._report(operation="failed", path=str(target), ok=False, detail=str(e))
+            return ToolResult.error(f"Error: {e}{TRASH_UNAVAILABLE_NOTE}")
+
+        self._report(operation=outcome, path=str(target), ok=True)
+        if outcome == "trashed":
+            return f"Moved to the system recycle bin: {target}"
+        return f"Deleted (temp directory, not recycled): {target}"

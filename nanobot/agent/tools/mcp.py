@@ -1140,8 +1140,14 @@ async def connect_mcp_servers(
             tools = await session.list_tools()
             enabled_tools = set(cfg.enabled_tools)
             allow_all_tools = "*" in enabled_tools
+            # [LOCAL PATCH] nanowork：工具级授权黑名单（见 MCPServerConfig.disabled_tools）。
+            # 与上游白名单是**两把独立的裁剪刀**：白名单先裁，再裁黑名单；
+            # 两者都不命中才注册。刻意不与白名单合并成一个集合——合并会让
+            # 「白名单 = ["*"]」这条"无限制"语义被黑名单的存在悄悄改变。
+            disabled_tools = set(cfg.disabled_tools)
             registered_count = 0
             matched_enabled_tools: set[str] = set()
+            matched_disabled_tools: set[str] = set()
             available_raw_names = [tool_def.name for tool_def in tools.tools]
             available_wrapped_names = [_sanitize_mcp_tool_name(f"mcp_{name}_{tool_def.name}") for tool_def in tools.tools]
             for tool_def in tools.tools:
@@ -1153,6 +1159,19 @@ async def connect_mcp_servers(
                 ):
                     logger.debug(
                         "MCP: skipping tool '{}' from server '{}' (not in enabledTools)",
+                        wrapped_name,
+                        name,
+                    )
+                    continue
+                # [LOCAL PATCH] nanowork：黑名单只作用于 tools。
+                # resources / prompts 不参与逐工具授权——把它们一起砍掉会让
+                # 「禁用了一个工具」变成「整台 server 的能力都被降级」，
+                # 那是用户没有表达的意图。
+                if tool_def.name in disabled_tools or wrapped_name in disabled_tools:
+                    matched_disabled_tools.add(tool_def.name)
+                    matched_disabled_tools.add(wrapped_name)
+                    logger.debug(
+                        "MCP: skipping tool '{}' from server '{}' (disabledTools)",
                         wrapped_name,
                         name,
                     )
@@ -1178,6 +1197,19 @@ async def connect_mcp_servers(
                         ", ".join(available_raw_names) or "(none)",
                         ", ".join(available_wrapped_names) or "(none)",
                     )
+
+            # [LOCAL PATCH] nanowork：黑名单里写错的名字只警告、不报错。
+            # 与 enabledTools 的处理保持一致——授权表是限制性配置，条目失配时
+            # 「多禁了一个不存在的名字」没有任何破坏性，报错反而会让整台
+            # server 连接失败，把一个小笔误升级成一次功能中断。
+            if disabled_tools and not matched_disabled_tools:
+                logger.warning(
+                    "MCP server '{}': disabledTools entries matched nothing: {}. "
+                    "Available raw names: {}",
+                    name,
+                    ", ".join(sorted(disabled_tools)),
+                    ", ".join(available_raw_names) or "(none)",
+                )
 
             # Only register resources and prompts when no tool restriction is
             # active.  enabledTools is a per-*tool* allowlist; resources and
@@ -1329,11 +1361,15 @@ def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
 
 
 def _configured_servers(config: Config) -> dict[str, MCPServerConfig]:
-    from nanobot.agent.plugins import agent_plugin_mcp_servers
+    from nanobot.agent.plugins import agent_plugin_mcp_servers, default_user_plugins_dir
 
+    # [LOCAL PATCH] FR-3.4：插件来源要覆盖用户级目录（~/.nanowork/plugins）。
+    # 这里没有注入通道（`_configured_servers` 只拿得到配置对象），只能取产品
+    # 默认路径；测试都通过 `server_loader` 显式注入，不走这条线。
     return agent_plugin_mcp_servers(
         config.workspace_path,
         config.tools.mcp_servers,
+        default_user_plugins_dir(),
     )
 
 

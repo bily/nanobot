@@ -8,12 +8,14 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, TypedDict
+from typing import Any, Callable, NotRequired, TypedDict
 
 from loguru import logger
 
-from nanobot.agent.hook import AgentHook, AgentHookContext
-from nanobot.agent.runner import AgentRunner, AgentRunResult, AgentRunSpec
+from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
+from nanobot.agent.hooks.session_mode import SessionModeHook
+from nanobot.agent.hooks.tool_approval import ToolApprovalHook
+from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.base import ToolResult
 from nanobot.agent.tools.context import (
     RequestContext,
@@ -28,7 +30,8 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import AgentDefaults, ToolsConfig
-from nanobot.providers.base import LLMProvider
+from nanobot.llm_usage.context import LLMUsageSource, current_llm_usage_source
+from nanobot.providers.base import LLMProvider, LLMUsage
 from nanobot.security.workspace_access import (
     WorkspaceScope,
     bind_workspace_scope,
@@ -43,6 +46,7 @@ class _SubagentOrigin(TypedDict):
     channel: str
     chat_id: str
     session_key: str | None
+    llm_usage_source: NotRequired[LLMUsageSource]
 
 
 @dataclass(slots=True)
@@ -53,10 +57,11 @@ class SubagentStatus:
     label: str
     task_description: str
     started_at: float          # time.monotonic()
-    phase: str = "initializing"  # initializing | awaiting_tools | tools_completed | final_response | done | error
+    # queued | initializing | awaiting_tools | tools_completed | final_response | done | error
+    phase: str = "initializing"
     iteration: int = 0
     tool_events: list[dict[str, str]] = field(default_factory=list)
-    usage: dict[str, int] = field(default_factory=dict)
+    usage: LLMUsage | None = None
     stop_reason: str | None = None
     error: str | None = None
 
@@ -82,7 +87,7 @@ class _SubagentHook(AgentHook):
             return
         self._status.iteration = context.iteration
         self._status.tool_events = list(context.tool_events)
-        self._status.usage = dict(context.usage)
+        self._status.usage = context.usage
         if context.error:
             self._status.error = str(context.error)
 
@@ -100,9 +105,11 @@ class SubagentManager:
         tools_config: ToolsConfig | None = None,
         restrict_to_workspace: bool = False,
         disabled_skills: list[str] | None = None,
+        skill_overrides: dict[str, str] | None = None,
+        user_skills_dir: Path | None = None,
+        user_plugins_dir: Path | None = None,
         max_iterations: int | None = None,
         max_concurrent_subagents: int | None = None,
-        fail_on_tool_error: bool | None = None,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
     ):
         if workspace is None:
@@ -136,6 +143,14 @@ class SubagentManager:
         self.max_tool_result_chars = max_tool_result_chars
         self.restrict_to_workspace = restrict_to_workspace
         self.disabled_skills = set(disabled_skills or [])
+        # [LOCAL PATCH] FR-3.1：子代理的技能清单必须与主代理**同源**。
+        # 只在主代理上套三态覆盖、子代理仍全量列出，等于给模型开了一条
+        # 「把被禁的技能交给子代理去用」的旁路。
+        self.skill_overrides = dict(skill_overrides or {})
+        self.user_skills_dir = user_skills_dir
+        # [LOCAL PATCH] FR-3.4：插件目录同理——子代理看到的插件技能
+        # 必须与主代理一致，否则用户级插件里的技能会在子代理侧凭空消失。
+        self.user_plugins_dir = user_plugins_dir
         self.max_iterations = (
             max_iterations
             if max_iterations is not None
@@ -146,11 +161,7 @@ class SubagentManager:
             if max_concurrent_subagents is not None
             else defaults.max_concurrent_subagents
         )
-        self.fail_on_tool_error = (
-            fail_on_tool_error
-            if fail_on_tool_error is not None
-            else defaults.fail_on_tool_error
-        )
+        self._run_slots = asyncio.Semaphore(self.max_concurrent_subagents)
         self.runner = AgentRunner()
         self._exec_session_manager = ExecSessionManager()
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
@@ -224,6 +235,8 @@ class SubagentManager:
                 restrict_to_workspace=cfg.restrict_to_workspace,
                 workspace=root,
             ),
+            # [LOCAL PATCH] FR-3.4：与 SkillsLoader 同源。
+            user_plugins_dir=self.user_plugins_dir,
         )
         ToolLoader().load(ctx, registry, scope="subagent")
         return registry
@@ -252,6 +265,7 @@ class SubagentManager:
             "channel": origin_channel,
             "chat_id": origin_chat_id,
             "session_key": session_key,
+            "llm_usage_source": current_llm_usage_source(),
         }
 
         status = SubagentStatus(
@@ -315,6 +329,7 @@ class SubagentManager:
             "channel": origin_channel,
             "chat_id": origin_chat_id,
             "session_key": session_key,
+            "llm_usage_source": current_llm_usage_source(),
         }
         status = SubagentStatus(
             task_id=task_id,
@@ -342,7 +357,7 @@ class SubagentManager:
             self._session_tasks.setdefault(session_key, set()).add(task_id)
         try:
             result = await inline_task
-            if status.phase == "error" or status.stop_reason in {"error", "tool_error"}:
+            if status.phase == "error" or status.stop_reason == "error":
                 return ToolResult.error(result)
             return result
         finally:
@@ -354,6 +369,35 @@ class SubagentManager:
                     del self._session_tasks[session_key]
 
     async def _run_subagent(
+        self,
+        task_id: str,
+        task: str,
+        label: str,
+        origin: _SubagentOrigin,
+        status: SubagentStatus,
+        runtime: LLMRuntime,
+        origin_message_id: str | None = None,
+        workspace_scope: WorkspaceScope | None = None,
+        *,
+        announce: bool = True,
+    ) -> str:
+        """Wait for capacity, then execute one subagent task."""
+        status.phase = "queued"
+        async with self._run_slots:
+            status.phase = "initializing"
+            return await self._run_admitted_subagent(
+                task_id,
+                task,
+                label,
+                origin,
+                status,
+                runtime,
+                origin_message_id,
+                workspace_scope,
+                announce=announce,
+            )
+
+    async def _run_admitted_subagent(
         self,
         task_id: str,
         task: str,
@@ -408,15 +452,32 @@ class SubagentManager:
                     runtime=runtime,
                     max_iterations=self.max_iterations,
                     max_tool_result_chars=self.max_tool_result_chars,
-                    hook=_SubagentHook(task_id, status),
+                    # [LOCAL PATCH] nanowork：子代理不走
+                    # build_agent_turn_hook，而是直接给 runner 传 hook——若不在这里
+                    # 组合审批门，子代理就成了逐条批准策略的旁路。
+                    # 子代理没有进度通道，故 ToolApprovalHook 拿不到 on_progress：
+                    # ask 模式下其写类调用会被 fail-closed 拒绝（等价于子代理只读），
+                    # 拒绝原因会作为工具结果回注，父代理据此改道。
+                    # SessionModeHook 同理由此挂上：ask/plan 下 spawn 本身就被拒，
+                    # 但作用域一旦带着只读模式绑进来，就不该指望「父代理进不来」来兜底。
+                    hook=CompositeHook(
+                        [
+                            _SubagentHook(task_id, status),
+                            ToolApprovalHook(),
+                            SessionModeHook(),
+                        ]
+                    ),
                     max_iterations_message="Task completed but no final response was generated.",
                     finalize_on_max_iterations=False,
                     error_message=None,
-                    fail_on_tool_error=self.fail_on_tool_error,
                     checkpoint_callback=_on_checkpoint,
                     session_key=sess_key,
                     workspace=root,
                     llm_timeout_s=llm_timeout,
+                    llm_usage_source=origin.get(
+                        "llm_usage_source",
+                        current_llm_usage_source(),
+                    ),
                 ))
             finally:
                 if token is not None:
@@ -425,11 +486,7 @@ class SubagentManager:
             status.phase = "done"
             status.stop_reason = result.stop_reason
 
-            if result.stop_reason == "tool_error":
-                status.tool_events = list(result.tool_events)
-                final_result = self._format_partial_progress(result)
-                final_status = "error"
-            elif result.stop_reason == "error":
+            if result.stop_reason == "error":
                 final_result = result.error or "Error: subagent execution failed."
                 final_status = "error"
             else:
@@ -510,27 +567,6 @@ class SubagentManager:
         await self.bus.publish_inbound(msg)
         logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
 
-    @staticmethod
-    def _format_partial_progress(result: AgentRunResult) -> str:
-        completed = [e for e in result.tool_events if e["status"] == "ok"]
-        failure = next((e for e in reversed(result.tool_events) if e["status"] == "error"), None)
-        lines: list[str] = []
-        if completed:
-            lines.append("Completed steps:")
-            for event in completed[-3:]:
-                lines.append(f"- {event['name']}: {event['detail']}")
-        if failure:
-            if lines:
-                lines.append("")
-            lines.append("Failure:")
-            lines.append(f"- {failure['name']}: {failure['detail']}")
-        if result.error and not failure:
-            if lines:
-                lines.append("")
-            lines.append("Failure:")
-            lines.append(f"- {result.error}")
-        return "\n".join(lines) or (result.error or "Error: subagent execution failed.")
-
     def _build_subagent_prompt(self, workspace: Path | None = None) -> str:
         """Build a focused system prompt for the subagent."""
         from nanobot.agent.skills import SkillsLoader
@@ -540,13 +576,24 @@ class SubagentManager:
         skills_summary = SkillsLoader(
             self.workspace,
             disabled_skills=self.disabled_skills,
-        ).build_skills_summary()
+            skill_overrides=self.skill_overrides,
+            user_skills_dir=self.user_skills_dir,
+            user_plugins_dir=self.user_plugins_dir,
+        ).build_skills_summary(workspace=project_workspace)
+        history_log = (
+            str(agent_workspace / "memory" / "history.jsonl")
+            if agent_workspace != project_workspace
+            else "memory/history.jsonl"
+        )
         return render_template(
             "agent/subagent_system.md",
             workspace=str(project_workspace),
             agent_workspace=str(agent_workspace),
-            history_log=str(agent_workspace / "memory" / "history.jsonl"),
+            history_log=history_log,
             skills_summary=skills_summary or "",
+            # [LOCAL PATCH] 子代理提示词同样可被 <workspace>/prompts/ 覆盖（§13.4）。
+            # 注意 `workspace` 是**模板变量**、`override_root` 是**覆盖根**，两者不可合并。
+            override_root=project_workspace,
         )
 
     async def cancel_by_session(self, session_key: str) -> int:

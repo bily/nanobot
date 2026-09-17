@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentManager
     from nanobot.agent.tools.exec_session import ExecSessionManager
     from nanobot.agent.tools.file_state import FileStates
+    from nanobot.agent.tools.runtime_control import RuntimeControl
     from nanobot.bus.queue import MessageBus
     from nanobot.bus.runtime_events import RuntimeEventBus
     from nanobot.config.schema import ProviderConfig, ToolsConfig
@@ -90,3 +91,13 @@ class ToolContext:
     timezone: str = "UTC"
     workspace_sandbox: WorkspaceSandboxStatus | None = None
     runtime_events: RuntimeEventBus | None = None
+    runtime_control: RuntimeControl | None = None
+    # [LOCAL PATCH] FR-3.4：用户级插件目录（跨工作区共享）。
+    #
+    # 文件工具的读闸口需要它来判断「用户级插件里的技能能不能读」。这个值必须
+    # 与 ``SkillsLoader`` 收到的是**同一个来源**：两边各算一次默认路径会得到
+    # 不同的缓存 key，同一份插件包被扫两遍（上游用例
+    # ``test_project_reads_do_not_rescan_cached_plugin_packages`` 正是这个金丝雀）。
+    #
+    # 默认 ``None`` = 不扫描用户级插件，由调用方显式注入产品路径。
+    user_plugins_dir: Path | None = None

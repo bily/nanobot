@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -84,7 +85,10 @@ def test_plugin_skill_lifecycle_and_precedence(tmp_path: Path) -> None:
     assert loader.get_explicitly_invoked_skills("Use $shared") == ["shared"]
     assert loader.get_always_skills() == ["shared"]
     assert "Plugin body" in (loader.load_skill("shared") or "")
-    assert "`demo/skills/shared/SKILL.md`" in loader.build_skills_summary()
+    summary = loader.build_skills_summary()
+    assert "### Agent Plugin skills (`plugins`)" in summary
+    assert "`demo/skills/shared/SKILL.md`" in summary
+    assert str(tmp_path.resolve()) not in summary
 
     set_agent_plugin_enabled(tmp_path, "demo", False)
     assert [entry["source"] for entry in loader.list_skills()] == ["builtin"]
@@ -462,3 +466,256 @@ def test_plugin_activation_does_not_survive_in_place_code_replacement(
     assert discover_agent_plugins(tmp_path)[0].enabled is False
     assert enabled_agent_plugin_skill_dirs(tmp_path) == ()
     assert agent_plugin_mcp_servers(tmp_path) == {}
+
+
+# ---------------------------------------------------------------------------
+# [LOCAL PATCH] FR-3.4：用户级插件目录（~/.nanowork/plugins）
+# ---------------------------------------------------------------------------
+
+
+def _user_plugin(user_dir: Path, name: str = "demo", **fields: object) -> Path:
+    root = user_dir / name
+    _write_json(root / "plugin.json", _manifest(name, **fields))
+    return root
+
+
+def _loaded_skills_for(workspace: Path, user_dir: Path) -> list[str]:
+    return [name for name, _ in enabled_agent_plugin_skills(workspace, user_dir)]
+
+
+def test_user_level_plugin_is_discovered_and_toggleable(tmp_path: Path) -> None:
+    user_dir = tmp_path / "user-plugins"
+    plugin = _user_plugin(user_dir)
+    _skill(plugin / "skills", "demo-skill")
+
+    assert discover_agent_plugins(tmp_path, user_dir)[0].enabled is False
+    set_agent_plugin_enabled(tmp_path, "demo", True, user_dir)
+    assert discover_agent_plugins(tmp_path, user_dir)[0].enabled is True
+    assert _loaded_skills_for(tmp_path, user_dir) == ["demo-skill"]
+    set_agent_plugin_enabled(tmp_path, "demo", False, user_dir)
+    assert discover_agent_plugins(tmp_path, user_dir)[0].enabled is False
+    assert _loaded_skills_for(tmp_path, user_dir) == []
+
+
+def test_user_level_plugins_stay_invisible_without_the_directory(tmp_path: Path) -> None:
+    """没注入用户级目录就完全看不见它——单测的隔离性靠这一条守住。
+
+    这是刻意的：``_installed_plugins`` 不自己兜 ``default_user_plugins_dir()``，
+    否则每个构造 Agent 的单测都会去读开发者宿主机上真实装了什么。
+    """
+    user_dir = tmp_path / "user-plugins"
+    plugin = _user_plugin(user_dir)
+    _skill(plugin / "skills", "demo-skill")
+    set_agent_plugin_enabled(tmp_path, "demo", True, user_dir)
+
+    assert enabled_agent_plugin_skills(tmp_path) == []
+    assert discover_agent_plugins(tmp_path) == []
+
+
+def test_project_plugin_shadows_user_plugin_with_same_identity(tmp_path: Path) -> None:
+    """同名时项目级赢——扫描顺序是先到先得，所以项目级必须排在前面。"""
+    user_dir = tmp_path / "user-plugins"
+    user_plugin = _user_plugin(user_dir, "demo", description="user copy")
+    _skill(user_plugin / "skills", "user-only")
+    project_plugin = _plugin(tmp_path, "demo", description="project copy")
+    _skill(project_plugin / "skills", "project-only")
+
+    set_agent_plugin_enabled(tmp_path, "demo", True, user_dir)
+
+    discovered = discover_agent_plugins(tmp_path, user_dir)
+    assert [plugin.description for plugin in discovered] == ["project copy"]
+    assert discovered[0].root == project_plugin
+    assert _loaded_skills_for(tmp_path, user_dir) == ["project-only"]
+
+
+def test_user_level_plugin_mcp_servers_require_enable(tmp_path: Path) -> None:
+    user_dir = tmp_path / "user-plugins"
+    plugin = _user_plugin(user_dir)
+    _write_json(
+        plugin / "mcp.json",
+        {
+            "$schema": AGENT_PLUGIN_MCP_SCHEMA,
+            "mcpServers": {"srv": {"type": "stdio", "command": "python"}},
+        },
+    )
+
+    assert agent_plugin_mcp_servers(tmp_path, None, user_dir) == {}
+    set_agent_plugin_enabled(tmp_path, "demo", True, user_dir)
+    assert list(agent_plugin_mcp_servers(tmp_path, None, user_dir)) == ["demo"]
+
+
+def test_user_level_plugin_packages_with_distinct_names_coexist(tmp_path: Path) -> None:
+    user_dir = tmp_path / "user-plugins"
+    for name in ("alpha", "beta"):
+        _skill(_user_plugin(user_dir, name) / "skills", f"{name}-skill")
+        set_agent_plugin_enabled(tmp_path, name, True, user_dir)
+
+    assert sorted(plugin.name for plugin in discover_agent_plugins(tmp_path, user_dir)) == [
+        "alpha",
+        "beta",
+    ]
+    assert sorted(_loaded_skills_for(tmp_path, user_dir)) == ["alpha-skill", "beta-skill"]
+
+
+# ---------------------------------------------------------------------------
+# [LOCAL PATCH] FR-3.4：组件位置回退（PRD §12.2 的 .nanowork-plugin / mcp/）
+# ---------------------------------------------------------------------------
+
+
+def test_alternate_component_locations_are_accepted(tmp_path: Path) -> None:
+    root = tmp_path / "plugins" / "demo"
+    _write_json(root / ".nanowork-plugin" / "plugin.json", _manifest("demo"))
+    _skill(root / "skills", "demo-skill")
+    _write_json(
+        root / "mcp" / "mcp.json",
+        {
+            "$schema": AGENT_PLUGIN_MCP_SCHEMA,
+            "mcpServers": {"srv": {"type": "stdio", "command": "python"}},
+        },
+    )
+
+    discovered = discover_agent_plugins(tmp_path)
+    assert [plugin.name for plugin in discovered] == ["demo"]
+    assert discovered[0].mcp_servers == ("srv",)
+
+
+def test_root_manifest_wins_over_alternate_location(tmp_path: Path) -> None:
+    root = tmp_path / "plugins" / "demo"
+    _write_json(root / "plugin.json", _manifest("demo", description="root copy"))
+    _write_json(
+        root / ".nanowork-plugin" / "plugin.json",
+        _manifest("demo", description="dotdir copy"),
+    )
+
+    assert discover_agent_plugins(tmp_path)[0].description == "root copy"
+
+
+def test_broken_root_manifest_does_not_silently_fall_back(tmp_path: Path) -> None:
+    """高优先级位置存在但内容坏，就是明确失败——不回退到备用位置。
+
+    回退会让一份坏清单被另一份好清单掩盖，出问题时无从解释。
+    """
+    root = tmp_path / "plugins" / "demo"
+    root.mkdir(parents=True)
+    (root / "plugin.json").write_text("{ this is not json", encoding="utf-8")
+    _write_json(root / ".nanowork-plugin" / "plugin.json", _manifest("demo"))
+
+    assert discover_agent_plugins(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# [LOCAL PATCH] FR-3.4：用户级插件的技能必须既列得出来、也读得进去
+# ---------------------------------------------------------------------------
+
+
+def test_user_plugin_skill_appears_in_summary_with_usable_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "agent"
+    user_dir = tmp_path / "user-plugins"
+    plugin = _user_plugin(user_dir)
+    _skill(plugin / "skills", "demo-skill", "name: demo-skill\ndescription: User plugin skill.")
+    set_agent_plugin_enabled(workspace, "demo", True, user_dir)
+
+    summary = SkillsLoader(workspace, user_plugins_dir=user_dir).build_skills_summary()
+
+    assert "demo-skill" in summary
+    # 用户级插件不在 <workspace>/plugins 之下：硬算相对路径会抛 ValueError，
+    # 算出来也会把模型指向别的地方——所以必须落成绝对路径。
+    assert "demo-skill/SKILL.md" in summary
+
+
+@pytest.mark.asyncio
+async def test_user_level_plugin_skill_is_readable_when_restricted(tmp_path: Path) -> None:
+    """用户级插件的技能要同时满足"列得出来"和"读得进去"。
+
+    少了 ``ToolContext.user_plugins_dir``，技能会出现在提示词清单里却在
+    ``read_file`` 时被判越权——看得见、读不到。这里用**同一个值**同时喂给
+    ``ToolsConfig`` 侧和文件工具侧，镜像生产接线（``loop.py`` 用
+    ``default_user_plugins_dir()`` 一次性注入两处）。
+    """
+    agent_workspace = tmp_path / "agent"
+    user_dir = tmp_path / "home" / "plugins"
+    plugin = _user_plugin(user_dir)
+    skill = _skill(plugin / "skills", "demo-skill")
+    resource = skill / "reference.md"
+    resource.write_text("user plugin reference", encoding="utf-8")
+    set_agent_plugin_enabled(agent_workspace, "demo", True, user_dir)
+
+    project = tmp_path / "project"
+    project.mkdir()
+    scope = validate_workspace_scope_payload(
+        {"project_path": str(project), "access_mode": "restricted"},
+        default_workspace=agent_workspace,
+        default_restrict_to_workspace=True,
+    )
+
+    def build_read_tool(**ctx_kwargs: object):
+        return ReadFileTool.create(
+            ToolContext(
+                config=ToolsConfig(restrict_to_workspace=True),
+                workspace=str(agent_workspace),
+                **ctx_kwargs,  # type: ignore[arg-type]
+            )
+        )
+
+    async def read_with(tool) -> str:
+        token = bind_workspace_scope(scope)
+        try:
+            return await tool.execute(path=str(resource))
+        finally:
+            reset_workspace_scope(token)
+
+    # 注入了目录 → 读得到。
+    shared = build_read_tool(user_plugins_dir=user_dir)
+    assert "user plugin reference" in await read_with(shared)
+
+    # 没注入 → **fail-closed**，明确拒绝（而不是悄悄放行或误报可用）。
+    denied_tool = build_read_tool()
+    denied = await read_with(denied_tool)
+    assert "user plugin reference" not in denied
+    assert denied.startswith("Error:")
+
+
+def test_agent_registers_tool_context_with_the_user_plugins_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """守住生产接线：``Agent`` 必须把它收到的用户级插件目录传进 ``ToolContext``。
+
+    上面那条读闸口用例是**手工注入** ctx 的，所以它测不出「``loop.py`` 忘了接线」。
+    而这正是最容易静默失灵的一处：忘了接，技能"列得出来、读不到"，没有任何
+    报错，只有模型反复读文件失败。这里用轻量 stub 直接覆盖 ``Agent`` 的真实
+    构造路径——比端到端起一个 Agent 便宜得多。
+    """
+    from types import SimpleNamespace
+
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.agent.tools.loader import ToolLoader
+
+    user_dir = tmp_path / "user-plugins"
+    captured: list[object] = []
+
+    def fake_load(self_, ctx, registry, scope=None):  # noqa: ANN001, ARG001
+        captured.append(ctx)
+        return []
+
+    monkeypatch.setattr(ToolLoader, "load", fake_load)
+
+    stub = SimpleNamespace(
+        tools_config=ToolsConfig(),
+        workspace=tmp_path,
+        bus=None,
+        subagents=None,
+        cron_service=None,
+        _exec_session_manager=None,
+        sessions=None,
+        _image_generation_provider_configs=None,
+        context=SimpleNamespace(timezone="UTC"),
+        workspace_scopes=SimpleNamespace(sandbox_status=None),
+        runtime_events=None,
+        tools=SimpleNamespace(),
+        user_plugins_dir=user_dir,
+    )
+    AgentLoop._register_default_tools(stub, provider_snapshot_loader=None)
+
+    assert len(captured) == 1
+    ctx = cast(Any, captured[0])
+    assert ctx.user_plugins_dir == user_dir

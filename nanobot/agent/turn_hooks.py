@@ -15,6 +15,9 @@ from nanobot.agent.hook import (
     AgentTurnHookFactory,
     CompositeHook,
 )
+from nanobot.agent.hooks.agent_tools import create_agent_tool_policy_hook
+from nanobot.agent.hooks.session_mode import create_session_mode_hook
+from nanobot.agent.hooks.tool_approval import create_tool_approval_hook
 from nanobot.agent.progress_hook import AgentProgressHook
 
 
@@ -32,7 +35,6 @@ class AgentTurnHookSpec:
     session_key: str | None = None
     workspace: Path | None = None
     tool_hint_max_length: int = 40
-    on_iteration: Callable[[int], None] | None = None
     registered_hook_factories: list[AgentTurnHookFactory] = field(default_factory=list)
     turn_hook_factories: list[AgentTurnHookFactory] = field(default_factory=list)
     registered_hooks: list[AgentHook] = field(default_factory=list)
@@ -50,11 +52,7 @@ def build_agent_turn_hook(spec: AgentTurnHookSpec) -> AgentHook:
         on_stream_end=spec.on_stream_end,
         session_key=spec.session_key,
         tool_hint_max_length=spec.tool_hint_max_length,
-        on_iteration=spec.on_iteration,
     )
-    if spec.ephemeral and not spec.run_extra_hooks_for_ephemeral:
-        return progress_hook
-
     turn_context = AgentTurnHookContext(
         on_progress=spec.on_progress,
         workspace=spec.workspace,
@@ -66,7 +64,37 @@ def build_agent_turn_hook(spec: AgentTurnHookSpec) -> AgentHook:
         attributes=dict(spec.attributes or {}),
         ephemeral=spec.ephemeral,
     )
-    hook_chain: list[AgentHook] = [progress_hook]
+
+    # [LOCAL PATCH] nanowork：审批门是基线能力，不是可选扩展。
+    # 原实现在 ephemeral turn 上直接返回 progress_hook，从而跳过全部工厂——
+    # 定时任务与不持久化会话会因此成为审批策略的旁路。故把它提到工厂之前装配。
+    approval_hook = create_tool_approval_hook(turn_context)
+    baseline_chain: list[AgentHook] = [progress_hook]
+    if approval_hook is not None:
+        baseline_chain.append(approval_hook)
+
+    # [LOCAL PATCH] nanowork：执行模式（FR-1.4/1.5）与审批门同级。
+    # ask/plan 的只读语义同样不能在 ephemeral turn 上被跳过，否则同一份
+    # 作用域在不同入口下硬度不一致（见 10.3.1）。
+    session_mode_hook = create_session_mode_hook(turn_context)
+    if session_mode_hook is not None:
+        baseline_chain.append(session_mode_hook)
+
+    # [LOCAL PATCH] nanowork：Agent 工具白名单（FR-2.2）同样是基线能力。
+    # 授权门和上面的两道门一样不能被 ephemeral turn 跳过——定时任务里的 Agent
+    # 若绕开自己的工具约束，最小权限就只是「交互式会话才生效的礼貌」。
+    agent_tool_hook = create_agent_tool_policy_hook(turn_context)
+    if agent_tool_hook is not None:
+        baseline_chain.append(agent_tool_hook)
+
+    if spec.ephemeral and not spec.run_extra_hooks_for_ephemeral:
+        return (
+            CompositeHook(baseline_chain)
+            if len(baseline_chain) > 1
+            else progress_hook
+        )
+
+    hook_chain: list[AgentHook] = list(baseline_chain)
 
     for factory in spec.registered_hook_factories:
         try:

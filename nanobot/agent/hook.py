@@ -9,7 +9,7 @@ from typing import Any
 
 from loguru import logger
 
-from nanobot.providers.base import LLMResponse, ToolCallRequest
+from nanobot.providers.base import LLMResponse, LLMUsage, ToolCallRequest
 
 
 @dataclass(slots=True)
@@ -19,7 +19,7 @@ class AgentHookContext:
     iteration: int
     messages: list[dict[str, Any]]
     response: LLMResponse | None = None
-    usage: dict[str, int] = field(default_factory=dict)
+    usage: LLMUsage | None = None
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     tool_results: list[Any] = field(default_factory=list)
     tool_events: list[dict[str, str]] = field(default_factory=list)
@@ -39,7 +39,7 @@ class AgentRunHookContext:
     messages: list[dict[str, Any]]
     final_content: str | None = None
     tools_used: list[str] = field(default_factory=list)
-    usage: dict[str, int] = field(default_factory=dict)
+    usage: LLMUsage | None = None
     stop_reason: str | None = None
     error: str | None = None
     tool_events: list[dict[str, str]] = field(default_factory=list)
@@ -60,6 +60,28 @@ class AgentTurnHookContext:
     metadata: dict[str, Any] = field(default_factory=dict)
     ephemeral: bool = False
     attributes: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolExecutionDecision:
+    """Verdict on whether a tool call may proceed.
+
+    [LOCAL PATCH] nanowork：``before_execute_tool`` 的否决通道。
+    钩子返回 ``None`` 表示「无意见」（默认放行，保持既有钩子向后兼容），返回
+    一个 ``allowed=False`` 的决策则拦截本次调用——不抛异常，而是转成一条软错误
+    工具结果回注给模型，让它改道而不是崩掉整个 turn。
+    """
+
+    allowed: bool
+    reason: str = ""
+
+    @classmethod
+    def deny(cls, reason: str) -> ToolExecutionDecision:
+        return cls(allowed=False, reason=reason)
+
+    @classmethod
+    def allow(cls) -> ToolExecutionDecision:
+        return cls(allowed=True)
 
 
 class AgentHook:
@@ -109,8 +131,13 @@ class AgentHook:
         tool_call: ToolCallRequest,
         tool: Any,
         params: Any,
-    ) -> None:
-        pass
+    ) -> ToolExecutionDecision | None:
+        """Veto hook: return a denying decision to block this call.
+
+        ``None`` means "no opinion" and lets the call proceed — the default, so
+        observational hooks need no changes.
+        """
+        return None
 
     async def after_execute_tool(
         self,
@@ -181,6 +208,48 @@ class CompositeHook(AgentHook):
             except Exception:
                 logger.exception("AgentHook.{} error in {}", method_name, type(h).__name__)
 
+    async def _decide_for_each_hook(
+        self,
+        method_name: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> ToolExecutionDecision | None:
+        """Fan out a *decision* hook and merge the verdicts.
+
+        Deliberately not built on ``_for_each_hook_safe``: that helper is
+        fail-open (it swallows per-hook exceptions so an observer bug cannot
+        break the run). On a path that gates execution, swallowing an exception
+        would silently *allow* the call the policy was meant to stop, so a
+        raising hook counts as a refusal.
+
+        Every hook is still invoked even once a refusal is known: observer hooks
+        share this method, and the composite's contract is that every hook sees
+        every event. The loop only collects verdicts — a refusal is never
+        overridden by a later allow.
+        """
+        denial: ToolExecutionDecision | None = None
+        for h in self._hooks:
+            if getattr(h, "_reraise", False):
+                decision = await getattr(h, method_name)(*args, **kwargs)
+            else:
+                try:
+                    decision = await getattr(h, method_name)(*args, **kwargs)
+                except Exception:
+                    logger.exception(
+                        "AgentHook.{} failed; refusing (fail-closed) for {}",
+                        method_name,
+                        type(h).__name__,
+                    )
+                    if denial is None:
+                        denial = ToolExecutionDecision.deny(
+                            "The tool approval policy could not be evaluated "
+                            "and the call was refused as a precaution."
+                        )
+                    continue
+            if decision is not None and not decision.allowed and denial is None:
+                denial = decision
+        return denial
+
     async def before_iteration(self, context: AgentHookContext) -> None:
         await self._for_each_hook_safe("before_iteration", context)
 
@@ -218,8 +287,10 @@ class CompositeHook(AgentHook):
         tool_call: ToolCallRequest,
         tool: Any,
         params: Any,
-    ) -> None:
-        await self._for_each_hook_safe("before_execute_tool", context, tool_call, tool, params)
+    ) -> ToolExecutionDecision | None:
+        return await self._decide_for_each_hook(
+            "before_execute_tool", context, tool_call, tool, params
+        )
 
     async def after_execute_tool(
         self,
@@ -284,7 +355,7 @@ class SDKCaptureHook(AgentHook):
         super().__init__()
         self.tools_used: list[str] = []
         self.messages: list[dict[str, Any]] = []
-        self.usage: dict[str, int] = {}
+        self.usage: LLMUsage | None = None
         self.stop_reason: str | None = None
         self.error: str | None = None
         self.tool_events: list[dict[str, str]] = []
@@ -294,7 +365,7 @@ class SDKCaptureHook(AgentHook):
         for call in context.tool_calls:
             self.tools_used.append(call.name)
         self.messages = list(context.messages)
-        self.usage = dict(context.usage)
+        self.usage = context.usage
         self.stop_reason = context.stop_reason
         self.error = context.error
         self.tool_events = list(context.tool_events)
@@ -302,7 +373,7 @@ class SDKCaptureHook(AgentHook):
     async def after_run(self, context: AgentRunHookContext) -> None:
         self.tools_used = list(context.tools_used)
         self.messages = list(context.messages)
-        self.usage = dict(context.usage)
+        self.usage = context.usage
         self.stop_reason = context.stop_reason
         self.error = context.error
         self.tool_events = list(context.tool_events)

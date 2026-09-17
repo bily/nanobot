@@ -470,12 +470,25 @@ def test_exec_guard_blocks_windows_drive_root_outside_workspace(monkeypatch) -> 
 
 
 def test_exec_guard_allows_dev_null_redirect(tmp_path) -> None:
+    """[LOCAL PATCH] nanowork FR-8.3：`2>/dev/null` 仍然合法，但 `rm` 不再放行。
+
+    上游这条用例断言 ``rm "<ws>/file.txt" 2>/dev/null`` 被放行——它检验的是
+    「重定向到设备文件不该触发路径越界告警」。nanowork 把删除收口到
+    ``delete_file`` 后，同一命令必须被拦下；重定向的合法性改由非删除命令覆盖。
+    """
     tool = ExecTool(restrict_to_workspace=True)
     ws = tmp_path / "workspace"
     ws.mkdir()
     (ws / "file.txt").write_text("ok", encoding="utf-8")
-    error = tool._guard_command(f'rm "{ws / "file.txt"}" 2>/dev/null', str(ws))
-    assert error is None
+
+    # 重定向本身依然无害：非删除命令照常放行。
+    assert tool._guard_command("cat file.txt 2>/dev/null", str(ws)) is None
+
+    # 删除命令则被拦下，并指向 delete_file。
+    blocked = tool._guard_command(f'rm "{ws / "file.txt"}" 2>/dev/null', str(ws))
+    assert blocked is not None
+    assert "delete_file" in blocked
+    assert (ws / "file.txt").exists()
 
 
 def test_exec_guard_allows_dev_urandom(tmp_path) -> None:

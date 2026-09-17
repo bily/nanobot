@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Literal, Mapping, cast
 
 from nanobot.agent.plugins import (
     AgentPlugin,
+    default_user_plugins_dir,
     discover_agent_plugins,
     set_agent_plugin_enabled,
 )
@@ -967,7 +968,7 @@ def mcp_presets_payload(
     existing_names = {str(row["name"]) for row in (*preset_rows, *custom_rows)}
     plugin_rows = [
         _agent_plugin_payload(plugin)
-        for plugin in discover_agent_plugins(config.workspace_path)
+        for plugin in discover_agent_plugins(config.workspace_path, default_user_plugins_dir())
         if f"plugin-{plugin.name}" not in existing_names
     ]
     payload: dict[str, Any] = {
@@ -1643,7 +1644,7 @@ async def mcp_presets_settings_action(
     if name.startswith("plugin-"):
         plugin_config = load_config(config_path) if config_path is not None else load_config()
         plugin_name = name.removeprefix("plugin-")
-        plugins = discover_agent_plugins(plugin_config.workspace_path)
+        plugins = discover_agent_plugins(plugin_config.workspace_path, default_user_plugins_dir())
         plugin = next((item for item in plugins if item.name == plugin_name), None)
         if name not in plugin_config.tools.mcp_servers and plugin is not None:
             if action not in {"enable", "disable"}:
@@ -1653,6 +1654,7 @@ async def mcp_presets_settings_action(
                 plugin_config.workspace_path,
                 plugin_name,
                 action == "enable",
+                default_user_plugins_dir(),
             )
             verb = "enabled" if action == "enable" else "disabled"
             payload = mcp_presets_payload(

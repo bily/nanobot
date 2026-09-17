@@ -879,6 +879,166 @@ async def test_connect_mcp_servers_enabled_tools_warns_on_unknown_entries(
     assert "Available wrapped names: mcp_test_demo" in warnings[-1]
 
 
+# ——————————————————————————————————————————————
+# [LOCAL PATCH] nanowork：工具级授权黑名单（MCPServerConfig.disabled_tools）
+#
+# 与上游 enabled_tools 白名单是两把独立的裁剪刀：白名单先裁、再裁黑名单。
+# 最关键的一条不变量是「黑名单只作用于 tools」——它不得连带砍掉
+# resources / prompts，否则「禁用了一个工具」会变成「整台 server 被降级」。
+# ——————————————————————————————————————————————
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_disabled_tools_supports_raw_names(
+    fake_mcp_runtime: dict[str, object | None],
+) -> None:
+    """黑名单用原始工具名即可裁掉单个工具，其余照常注册。"""
+    fake_mcp_runtime["session"] = _make_fake_session(["demo", "other"])
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", disabled_tools=["demo"])},
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert registry.tool_names == ["mcp_test_other"]
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_disabled_tools_supports_wrapped_names(
+    fake_mcp_runtime: dict[str, object | None],
+) -> None:
+    """包装名（mcp_<server>_<tool>）同样要能命中——界面拿到的是原始名，
+    但用户也可能照着引擎日志里的包装名填。"""
+    fake_mcp_runtime["session"] = _make_fake_session(["demo", "other"])
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", disabled_tools=["mcp_test_demo"])},
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert registry.tool_names == ["mcp_test_other"]
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_disabled_tools_empty_list_registers_everything(
+    fake_mcp_runtime: dict[str, object | None],
+) -> None:
+    """空黑名单 = 无限制（默认态），不得有任何裁剪。"""
+    fake_mcp_runtime["session"] = _make_fake_session(["demo", "other"])
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", disabled_tools=[])},
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert registry.tool_names == ["mcp_test_demo", "mcp_test_other"]
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_disabled_tools_do_not_block_resources_and_prompts(
+    fake_mcp_runtime: dict[str, object | None],
+) -> None:
+    """黑名单只裁 tools：resources / prompts 必须照常注册。
+
+    这是黑名单与 enabledTools 白名单**语义分叉的那一点**：白名单一旦收窄就
+    连带关掉 resources/prompts（"限制能力类别"），而黑名单是逐工具授权，
+    用户禁一个工具并不等于宣告"这台 server 的能力我都不要了"。
+    """
+    fake_mcp_runtime["session"] = _make_fake_session_with_capabilities(
+        tool_names=["demo", "other"],
+        resource_names=["public_data"],
+        prompt_names=["help_prompt"],
+    )
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", disabled_tools=["demo"])},
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert "mcp_test_demo" not in registry.tool_names
+    assert "mcp_test_other" in registry.tool_names
+    assert any("public_data" in name for name in registry.tool_names)
+    assert any("help_prompt" in name for name in registry.tool_names)
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_disabled_tools_combine_with_enabled_tools(
+    fake_mcp_runtime: dict[str, object | None],
+) -> None:
+    """两把剪刀叠加：白名单先裁，黑名单再从剩下的里裁。"""
+    fake_mcp_runtime["session"] = _make_fake_session(["demo", "other", "third"])
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {
+            "test": MCPServerConfig(
+                command="fake",
+                enabled_tools=["demo", "other"],
+                disabled_tools=["other"],
+            )
+        },
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert registry.tool_names == ["mcp_test_demo"]
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_disabled_tools_allow_future_tools(
+    fake_mcp_runtime: dict[str, object | None],
+) -> None:
+    """黑名单里写了一个当前不存在的名字：不得影响任何现有工具。
+
+    这正是黑名单相对"客户端先算白名单"的优势所在——服务端后加的工具默认放行。
+    """
+    fake_mcp_runtime["session"] = _make_fake_session(["demo"])
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", disabled_tools=["not-yet-existing"])},
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert registry.tool_names == ["mcp_test_demo"]
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_disabled_tools_warn_when_nothing_matched(
+    fake_mcp_runtime: dict[str, object | None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """整条黑名单都没命中时给一条警告（写错了名字要能被发现）。"""
+    fake_mcp_runtime["session"] = _make_fake_session(["demo"])
+    registry = ToolRegistry()
+    warnings: list[str] = []
+
+    def _warning(message: str, *args: object) -> None:
+        warnings.append(message.format(*args))
+
+    monkeypatch.setattr("nanobot.agent.tools.mcp.logger.warning", _warning)
+
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", disabled_tools=["unknown"])},
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert registry.tool_names == ["mcp_test_demo"]
+    assert warnings
+    assert "disabledTools entries matched nothing: unknown" in warnings[-1]
+    assert "Available raw names: demo" in warnings[-1]
+
+
 @pytest.mark.asyncio
 async def test_connect_mcp_servers_logs_stdio_pollution_hint(
     monkeypatch: pytest.MonkeyPatch,

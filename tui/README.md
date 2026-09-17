@@ -9,13 +9,17 @@ bun run --cwd tui test
 bun run --cwd tui build
 ```
 
-`nanobot agent` launches this client, leases the shared local gateway or starts it on demand, and passes the local bootstrap endpoint through environment variables. The client paints before gateway readiness, retries bootstrap in the background, and obtains fresh WebSocket and REST credentials for each connection. Other terminals and the WebUI keep that gateway alive; the final interactive launcher to exit releases the on-demand process. Only `nanobot gateway --background` makes it persistent without clients. Source checkouts automatically align dependencies with `bun.lock` before launch; released installs use a version-matched, checksum-verified archive that keeps the executable together with its licenses, notices, corresponding application source, source offer, and relinking instructions. Startup fails explicitly if the native client is unavailable. The legacy Python prompt is only selected with `nanobot agent --classic`.
+`nanobot agent` launches this client, leases the shared local gateway or starts it on demand, and passes the local bootstrap endpoint through environment variables. The client paints before gateway readiness, retries bootstrap in the background, and obtains fresh WebSocket and REST credentials for each connection. Other terminals and the WebUI keep that gateway alive; the final interactive launcher to exit releases the on-demand process. `/detach` closes the TUI after promoting the gateway to persistent background mode, keeping any active agent turn running without clients; the restored terminal prints the exact stop command for that config and explicit workspace. `nanobot gateway --background` can start or promote it persistently before opening a client. Source checkouts automatically align dependencies with `bun.lock` before launch; released installs use a version-matched, checksum-verified archive that keeps the executable together with its licenses, notices, corresponding application source, source offer, and relinking instructions. Startup fails explicitly if the native client is unavailable. The legacy Python prompt is only selected with `nanobot agent --classic`.
 
 Standalone terminals use OpenTUI's retained full-screen layout: the transcript reflows with the terminal while the composer stays fixed at the bottom. Mouse and keyboard scrolling operate inside the transcript, and leaving the TUI restores the previous terminal screen.
 
+Assistant math written with `$...$`, `$$...$$`, `\\(...\\)`, or `\\[...\\]` is presented as
+Unicode plain text so formulas remain readable in terminals without a math renderer. Currency and
+LaTeX inside inline or fenced code remain literal.
+
 ## Herdr host mode
 
-When Herdr supplies `HERDR_ENV=1` and `HERDR_PANE_ID`, nanobot becomes a quiet hosted client. It uses OpenTUI's main-screen mode instead of hiding the whole run in a temporary alternate screen, removes the launch card and persistent session/model chrome, and keeps only the transcript, last user task, current progress, and composer. Herdr remains responsible for workspace, tab, pane, and attention navigation, while nanobot keeps its application-level session, new-chat, and branch commands.
+When Herdr supplies `HERDR_ENV=1` and `HERDR_PANE_ID`, nanobot becomes a quiet hosted client. It uses OpenTUI's main-screen mode instead of hiding the whole run in a temporary alternate screen, removes the launch card and persistent session/model/task chrome, and keeps only the transcript, compact progress, and composer. Herdr remains responsible for workspace, tab, pane, task, and attention navigation, while nanobot keeps its application-level session, new-chat, and branch commands.
 
 The TUI reports its WebSocket session ID, model, Git branch, workspace, last task, and current action through Herdr's supported pane CLI. Sending work reports `working`; a persisted explicit nanobot goal block reports `blocked`; a completed turn reports `idle`; exit releases lifecycle authority. The gateway session remains the durable transcript and resume path. Standalone terminals keep the richer full-screen navigation described below.
 
@@ -26,6 +30,10 @@ Changes reuse the gateway's normal model command and workspace policy checks.
 When you scroll away from the latest output, the scrollbar and `Ctrl+End` hint appear only until
 you return to the bottom. Large pastes are represented by a short editable placeholder in the
 composer; nanobot sends the original text unchanged.
+
+While a turn is running, the composer remains available for steering and uses `Steer this turn…`
+as its prompt. The footer shows the lifecycle and elapsed time without repeating the latest tool
+activity already visible in the transcript.
 
 Type `/` to discover slash commands published by the connected gateway. Use the arrow keys
 to move, `Tab` to complete, and `Esc` to close the menu.
@@ -43,8 +51,9 @@ Use `/sessions` to search and switch persisted conversations without leaving the
 `/new-chat` preserves the current conversation and starts another one; nanobot's existing `/new`
 command keeps its cross-channel behavior and resets the current chat. Each launch starts a new
 session using the launch directory as its workspace; `--session` selects an existing session and
-`--workspace` overrides the launch directory. When earlier transcript pages exist, press `PageUp`
-at the top to load them in place.
+`--workspace` overrides the launch directory. On exit, the restored terminal prints a ready-to-run
+`nanobot agent --session ...` command that resumes the current session. When earlier transcript
+pages exist, press `PageUp` at the top to load them in place.
 
 The native client accepts bare WebSocket chat IDs or `websocket:<id>` selectors. Use
 `nanobot agent --classic --session <channel:id>` to resume a session owned by another channel;

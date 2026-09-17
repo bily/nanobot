@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 from dataclasses import dataclass, replace
 from hashlib import sha256
@@ -23,6 +24,25 @@ AGENT_PLUGIN_MCP_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.js
 _PLUGIN_NAME = re.compile(r"^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
 _MCP_SERVER_FIELDS = {"type", "command", "args", "env", "cwd"}
 _MAX_LOGO_BYTES = 256 * 1024
+
+# —— [LOCAL PATCH] FR-3.4 组件位置候选 ——
+# 索引 0 是 agent-plugins.org 规范写的位置（引擎原生就认的那一份），
+# 索引 1 是 PRD §12.2 写的位置。**一个包只认一个真相**：按顺序取第一个
+# 存在的文件，不让两份清单各说各话；取不到才算缺组件。
+_PLUGIN_MANIFEST_RELPATHS = ("plugin.json", ".nanowork-plugin/plugin.json")
+_PLUGIN_MCP_RELPATHS = ("mcp.json", "mcp/mcp.json")
+
+
+def default_user_plugins_dir() -> Path:
+    """用户级插件目录：``~/.nanowork/plugins``（``NANOWORK_HOME`` 可改基址）。
+
+    与 :func:`nanobot.agent.skills.default_user_skills_dir` 同源同理——
+    刻意做成**函数**而不是模块常量：单测会在导入后才改环境变量，
+    模块常量会把宿主机上第一次导入时的取值冻住，结果不可复现。
+    """
+    home = os.environ.get("NANOWORK_HOME") or os.environ.get("CODEBUDDY_HOME")
+    base = Path(home).expanduser() if home else Path.home() / ".nanowork"
+    return base / "plugins"
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,32 +78,61 @@ class AgentPlugin:
     enabled: bool = False
 
 
-def _installed_plugins(workspace: Path) -> list[AgentPlugin]:
-    """Return installed packages found under ``<workspace>/plugins/*``."""
+def _plugin_roots(workspace: Path, user_plugins_dir: Path | None) -> list[Path]:
+    """按优先级返回要扫描的插件根目录（项目级在前）。
+
+    **顺序即优先级**：同名去重是先到先得，所以先扫的必须是高优先级的那一侧
+    ——这正是 PRD §12.4 里「用户级 < 项目级」的落地方式。
+    """
+    roots: list[Path] = []
     workspace = workspace.expanduser().resolve()
-    root = _contained(workspace / "plugins", workspace, directory=True)
-    if root is None:
-        return []
-    plugins: dict[str, AgentPlugin | None] = {}
-    for candidate in _children(root, "Agent Plugins directory"):
-        plugin_root = _contained(candidate, root, directory=True)
-        if plugin_root is None:
-            continue
-        plugin = _load_manifest(plugin_root)
-        if plugin is not None:
-            if plugin.name in plugins:
+    project_root = _contained(workspace / "plugins", workspace, directory=True)
+    if project_root is not None:
+        roots.append(project_root)
+    if user_plugins_dir is not None:
+        candidate = user_plugins_dir.expanduser()
+        # 用户级目录在工作区之外，用它的父目录做包含性检查——防的是
+        # `~/.nanowork/plugins` 被换成指向别处的符号链接。
+        user_root = _contained(candidate, candidate.parent.resolve(), directory=True)
+        if user_root is not None:
+            roots.append(user_root)
+    return roots
+
+
+def _installed_plugins(workspace: Path, user_plugins_dir: Path | None = None) -> list[AgentPlugin]:
+    """Return installed packages found under ``<workspace>/plugins/*`` and the user dir."""
+    plugins: dict[str, AgentPlugin] = {}
+    for root in _plugin_roots(workspace, user_plugins_dir):
+        # 单目录内重复身份视为脏数据，两个都丢弃（保持上游语义）；
+        # 跨目录重名则是正常的优先级覆盖，先扫的赢、后者静默让位。
+        seen: dict[str, AgentPlugin | None] = {}
+        for candidate in _children(root, "Agent Plugins directory"):
+            plugin_root = _contained(candidate, root, directory=True)
+            if plugin_root is None:
+                continue
+            plugin = _load_manifest(plugin_root)
+            if plugin is None:
+                continue
+            if plugin.name in seen:
                 logger.warning("Ignoring duplicate Agent Plugin identity '{}'", plugin.name)
-                plugins[plugin.name] = None
+                seen[plugin.name] = None
             else:
-                plugins[plugin.name] = plugin
-    return [plugin for plugin in plugins.values() if plugin is not None]
+                seen[plugin.name] = plugin
+        for name, plugin in seen.items():
+            if plugin is None or name in plugins:
+                continue
+            plugins[name] = plugin
+    return list(plugins.values())
 
 
-def enabled_agent_plugin_skills(workspace: Path) -> list[tuple[str, Path]]:
+def enabled_agent_plugin_skills(
+    workspace: Path,
+    user_plugins_dir: Path | None = None,
+) -> list[tuple[str, Path]]:
     """Verify and return skills from plugins the user has explicitly enabled."""
     skills: list[tuple[str, Path]] = []
     packages: list[_PackageSnapshot] = []
-    for plugin in _installed_plugins(workspace):
+    for plugin in _installed_plugins(workspace, user_plugins_dir):
         plugin_skills = _discover_plugin_skills(plugin.name, plugin.root)
         fingerprint = _enabled_package_fingerprint(workspace, plugin)
         if fingerprint is None:
@@ -98,7 +147,7 @@ def enabled_agent_plugin_skills(workspace: Path) -> list[tuple[str, Path]]:
                 )
             )
 
-    key = _skill_cache_key(workspace)
+    key = _skill_cache_key(workspace, user_plugins_dir)
     _SKILL_CACHE[key] = _SkillCacheEntry(tuple(skills), tuple(packages))
     return skills
 
@@ -107,12 +156,13 @@ def enabled_agent_plugin_skill_dirs(
     workspace: Path,
     *,
     requested_path: str | Path | None = None,
+    user_plugins_dir: Path | None = None,
 ) -> tuple[Path, ...]:
     """Return skill roots authorized for one read, revalidating their package."""
-    key = _skill_cache_key(workspace)
+    key = _skill_cache_key(workspace, user_plugins_dir)
     cached = _SKILL_CACHE.get(key)
     if cached is None:
-        enabled_agent_plugin_skills(workspace)
+        enabled_agent_plugin_skills(workspace, user_plugins_dir)
         cached = _SKILL_CACHE.get(key)
     if cached is None:
         return ()
@@ -132,7 +182,7 @@ def enabled_agent_plugin_skill_dirs(
         # Re-run the full activation check so a changed package loses its
         # marker and cannot become readable again through this cache.
         _invalidate_skill_cache(workspace)
-        enabled_agent_plugin_skills(workspace)
+        enabled_agent_plugin_skills(workspace, user_plugins_dir)
         return ()
 
     if target is None:
@@ -145,15 +195,25 @@ def enabled_agent_plugin_skill_dirs(
     )
 
 
-def _skill_cache_key(workspace: Path) -> tuple[Path, Path]:
+def _skill_cache_key(workspace: Path, user_plugins_dir: Path | None = None) -> tuple[Path, Path, str]:
+    """Cache key：同一工作区配不同用户级目录不得互相顶掉对方的缓存。"""
     return (
         workspace.expanduser().resolve(),
         get_config_path().expanduser().resolve(),
+        str(user_plugins_dir.expanduser().resolve()) if user_plugins_dir is not None else "",
     )
 
 
 def _invalidate_skill_cache(workspace: Path) -> None:
-    _SKILL_CACHE.pop(_skill_cache_key(workspace), None)
+    """丢弃该工作区的**全部**缓存项。
+
+    故意不按完整 key 精确删除：失效点（``_enabled_package_fingerprint``）
+    手里没有 user_plugins_dir，而漏删留下的条目会让已被停用的包继续可读。
+    这里按工作区前缀清空，宁可多清也不留脏。
+    """
+    prefix = workspace.expanduser().resolve()
+    for key in [key for key in _SKILL_CACHE if key[0] == prefix]:
+        _SKILL_CACHE.pop(key, None)
 
 
 def _package_fingerprint(root: Path) -> str | None:
@@ -180,7 +240,8 @@ def _package_fingerprint(root: Path) -> str | None:
 
 
 def _load_manifest(plugin_root: Path) -> AgentPlugin | None:
-    payload = _read_object(plugin_root / "plugin.json", plugin_root)
+    # [LOCAL PATCH] FR-3.4：支持组件位置回退（PRD §12.2 的 `.nanowork-plugin/`）。
+    payload = _read_first_object(plugin_root, _PLUGIN_MANIFEST_RELPATHS)
     if payload is None:
         return None
     if payload.get("$schema") != AGENT_PLUGIN_SCHEMA:
@@ -213,13 +274,14 @@ def _load_manifest(plugin_root: Path) -> AgentPlugin | None:
 def agent_plugin_mcp_servers(
     workspace: Path,
     configured: dict[str, MCPServerConfig] | None = None,
+    user_plugins_dir: Path | None = None,
 ) -> dict[str, MCPServerConfig]:
     """Merge explicitly enabled plugin MCP servers with user configuration.
 
     User configuration wins on the unlikely event of a namespaced collision.
     """
     servers: dict[str, MCPServerConfig] = {}
-    for plugin in _installed_plugins(workspace):
+    for plugin in _installed_plugins(workspace, user_plugins_dir):
         if not _enabled(workspace, plugin):
             continue
         plugin_servers = _plugin_mcp_servers(workspace, plugin)
@@ -234,7 +296,10 @@ def agent_plugin_mcp_servers(
     return servers | configured
 
 
-def discover_agent_plugins(workspace: Path) -> list[AgentPlugin]:
+def discover_agent_plugins(
+    workspace: Path,
+    user_plugins_dir: Path | None = None,
+) -> list[AgentPlugin]:
     """Return component and lifecycle state for discovered plugins."""
     return [
         replace(
@@ -242,13 +307,25 @@ def discover_agent_plugins(workspace: Path) -> list[AgentPlugin]:
             mcp_servers=tuple(sorted(_plugin_mcp_servers(workspace, plugin))),
             enabled=_enabled(workspace, plugin),
         )
-        for plugin in _installed_plugins(workspace)
+        for plugin in _installed_plugins(workspace, user_plugins_dir)
     ]
 
 
-def set_agent_plugin_enabled(workspace: Path, name: str, enabled: bool) -> None:
+def set_agent_plugin_enabled(
+    workspace: Path,
+    name: str,
+    enabled: bool,
+    user_plugins_dir: Path | None = None,
+) -> None:
     """Enable or disable one installed plugin."""
-    plugin = next((item for item in _installed_plugins(workspace) if item.name == name), None)
+    plugin = next(
+        (
+            item
+            for item in _installed_plugins(workspace, user_plugins_dir)
+            if item.name == name
+        ),
+        None,
+    )
     if plugin is None:
         raise ValueError(f"unknown Agent Plugin '{name}'")
     data = _plugin_data_dir(workspace, plugin.name, create=True)
@@ -302,7 +379,7 @@ def _plugin_logo(value: object, plugin_root: Path) -> str | None:
 
 
 def _plugin_mcp_servers(workspace: Path, plugin: AgentPlugin) -> dict[str, MCPServerConfig]:
-    payload = _read_object(plugin.root / "mcp.json", plugin.root)
+    payload = _read_first_object(plugin.root, _PLUGIN_MCP_RELPATHS)
     if payload is None:
         return {}
     raw_servers = payload.get("mcpServers")
@@ -498,6 +575,19 @@ def _contained(path: Path, root: Path, *, directory: bool = False) -> Path | Non
         return None
     expected_kind = resolved.is_dir() if directory else resolved.is_file()
     return resolved if expected_kind and resolved.is_relative_to(root) else None
+
+
+def _read_first_object(root: Path, relpaths: tuple[str, ...]) -> dict[str, object] | None:
+    """读取 ``relpaths`` 里第一个**存在**的组件（顺序即优先级）。
+
+    先判存在再解析，是为了让「高优先级位置存在但内容坏」表现为**明确的失败**，
+    而不是悄悄回退到低优先级位置——回退会让一份坏清单被另一份好清单掩盖。
+    """
+    for relpath in relpaths:
+        candidate = root / relpath
+        if candidate.is_file():
+            return _read_object(candidate, root)
+    return None
 
 
 def _read_object(path: Path, root: Path) -> dict[str, object] | None:

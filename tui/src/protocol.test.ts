@@ -356,14 +356,34 @@ describe("gateway protocol", () => {
       socket.emit("message", {
         data: JSON.stringify({ event: "ready", chat_id: "", client_id: "client" }),
       })
+      socket.emit("message", {
+        data: JSON.stringify({ event: "attached", chat_id: "draft-chat" }),
+      })
+      // A gateway restart re-sends ready while the TUI keeps the draft chat alive.
+      socket.emit("message", {
+        data: JSON.stringify({ event: "ready", chat_id: "", client_id: "client" }),
+      })
+      client.send("hello")
 
-      expect(socket.sent.map((value) => JSON.parse(value))).toEqual([{
-        type: "new_chat",
-        workspace_scope: {
-          project_path: "/tmp/launch-project",
-          access_mode: "restricted",
+      expect(socket.sent.map((value) => JSON.parse(value))).toEqual([
+        {
+          type: "new_chat",
+          workspace_scope: {
+            project_path: "/tmp/launch-project",
+            access_mode: "restricted",
+          },
         },
-      }])
+        { type: "attach", chat_id: "draft-chat" },
+        expect.objectContaining({
+          type: "message",
+          chat_id: "draft-chat",
+          content: "hello",
+          workspace_scope: {
+            project_path: "/tmp/launch-project",
+            access_mode: "restricted",
+          },
+        }),
+      ])
     } finally {
       Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: original })
     }
@@ -589,6 +609,62 @@ describe("gateway protocol", () => {
       })
       const outbound = sockets[1]?.sent.map((value) => JSON.parse(value)) || []
       expect(outbound).toEqual([{ type: "attach", chat_id: "generated-chat" }])
+      client.close()
+    } finally {
+      Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: original })
+    }
+  })
+
+  test("sends stale-safe recovery mutations and validates their response", async () => {
+    const original = globalThis.WebSocket
+    let socket: FakeSocket | undefined
+    Object.defineProperty(globalThis, "WebSocket", {
+      configurable: true,
+      value: class extends FakeSocket {
+        constructor() {
+          super()
+          socket = this
+        }
+      },
+    })
+
+    try {
+      const statuses: string[] = []
+      const client = new NanobotClient({
+        url: "ws://nanobot.test/ws",
+        onEvent: () => undefined,
+        onStatus: (status, detail) => statuses.push(`${status}:${detail || ""}`),
+      })
+      client.connect()
+      if (!socket) throw new Error("socket was not created")
+
+      const result = client.updateRecovery("continue", "chat", "recovery-1")
+      const request = JSON.parse(socket.sent.at(-1) || "{}") as {
+        request_id: string
+        action: string
+        payload: Record<string, string>
+      }
+      expect(request).toMatchObject({
+        type: "webui_request",
+        action: "recovery.continue",
+        payload: { chat_id: "chat", recovery_id: "recovery-1" },
+      })
+      socket.emit("message", { data: JSON.stringify({
+        event: "webui_response",
+        request_id: request.request_id,
+        ok: true,
+        result: { status: "resuming", recovery_id: "recovery-1", attempts: 1 },
+      }) })
+      expect(await result).toEqual({
+        status: "resuming",
+        recovery_id: "recovery-1",
+        attempts: 1,
+      })
+      expect(statuses).not.toContain("error:gateway sent an invalid event")
+
+      const interrupted = client.updateRecovery("dismiss", "chat", "recovery-2")
+      socket.emit("close")
+      await expect(interrupted).rejects.toThrow("gateway connection closed")
       client.close()
     } finally {
       Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: original })

@@ -128,8 +128,7 @@ class AgentDefaults(Base):
     temperature: float = 0.1
     fallback_models: list[FallbackCandidate] = Field(default_factory=list)
     max_tool_iterations: int = 200
-    max_concurrent_subagents: int = Field(default=1, ge=1)
-    fail_on_tool_error: bool = True
+    max_concurrent_subagents: int = Field(default=4, ge=1)
     max_tool_result_chars: int = 16_000
     provider_retry_mode: Literal["standard", "persistent"] = "standard"
     tool_hint_max_length: int = Field(
@@ -146,6 +145,12 @@ class AgentDefaults(Base):
     bot_icon: str = "🐈"  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
+    # [LOCAL PATCH] FR-3.1 技能三态覆盖：{"skill-name": "on" | "user-invocable-only" | "off"}。
+    # 与 disabled_skills 并存（后者等价于对一批名字写 "off"）；同一名字同时命中时取更严的一档。
+    # 取值不做字面校验——由 SkillsLoader.normalize_skill_override 统一收敛，
+    # 未知取值收敛为 "off"（fail-closed）。在这里加 Literal 校验会把整个 config
+    # 解析成失败，反而不如「收严」安全。
+    skill_overrides: dict[str, str] = Field(default_factory=dict)
     session_ttl_minutes: int = Field(
         default=15,
         ge=0,
@@ -156,13 +161,6 @@ class AgentDefaults(Base):
         default=60,
         ge=0,
     )  # Minimum interval in seconds between scans for idle sessions
-    consolidation_ratio: float = Field(
-        default=0.5,
-        ge=0.1,
-        le=0.95,
-        validation_alias=AliasChoices("consolidationRatio"),
-        serialization_alias="consolidationRatio",
-    )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
     @model_validator(mode="before")
@@ -337,7 +335,6 @@ class HeartbeatConfig(Base):
 
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
-    keep_recent_messages: int = 8
 
 
 class ApiConfig(Base):
@@ -382,6 +379,15 @@ class MCPServerConfig(Base):
     headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE: custom headers
     tool_timeout: int = 30  # seconds before a tool call is cancelled
     enabled_tools: list[str] = Field(default_factory=lambda: ["*"])  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool> names; ["*"] = all capabilities (tools, resources, prompts); any restriction = only listed tools, no resources/prompts
+    # [LOCAL PATCH] nanowork：工具级授权黑名单。接受原始 MCP 工具名或包装名
+    # （mcp_<server>_<tool>）。与上面的白名单**并存**：白名单先裁、再裁这里。
+    # 只影响 tools——resources / prompts 不受影响（黑名单是逐工具授权，
+    # 不是"限制能力类别"的开关）。
+    #
+    # 刻意做成黑名单而不是让上层计算白名单：白名单要在客户端先拿到服务端的
+    # 完整工具清单才能求补集，服务端新增工具时会静默变成"新工具自动被禁"；
+    # 黑名单天然对未来新增的工具放行。
+    disabled_tools: list[str] = Field(default_factory=list)
 
 
 def _lazy_default(module_path: str, class_name: str) -> Any:
@@ -709,8 +715,18 @@ def _resolve_tool_config_refs() -> None:
 
 
 # Eagerly resolve when the import chain allows it (no circular deps at this
-# point).  If it fails (first import triggers a cycle), the rebuild will
-# happen lazily when Config/ToolsConfig is first used at runtime.
+# point).  If it fails (first import triggered a cycle through
+# ``nanobot.agent.__init__``), the rebuild does *not* happen later on its own:
+# ``Config`` stays "not fully defined" and any ``Config.model_validate`` raises
+# ``PydanticUserError``.  Because this is swallowed, the symptom surfaces far
+# away — e.g. ``tests/config/test_model_presets.py``'s timezone subprocess.
+#
+# [LOCAL PATCH] 排查提示：若看到某个毫不相干的用例报
+# "`Config` is not fully defined; you should define `WebToolsConfig`"，
+# 去看是不是有人在 `agent/loop.py`（或 `agent/` 下别的被 `__init__`
+# 重导出的模块）里加了**模块级**的 `from nanobot.agent.plugins import ...`
+# ——它 import `nanobot.config.loader`，正好把这条链闭成环。
+# 需要用就放函数内局部导入。
 try:
     _resolve_tool_config_refs()
 except ImportError:

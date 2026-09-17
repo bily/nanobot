@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from nanobot.agent.context import ContextBuilder
+from nanobot.agent.context import ContextBuilder, TranscriptInput
 from nanobot.runtime_context import RuntimeContextBlock
 
 # ---------------------------------------------------------------------------
@@ -133,10 +133,7 @@ class TestLoadBootstrapFiles:
         (project / "SOUL.md").write_text("project soul collision", encoding="utf-8")
         (project / "USER.md").write_text("project user collision", encoding="utf-8")
 
-        result = ContextBuilder(agent_home).build_system_prompt(
-            workspace=project,
-            include_memory_recent_history=False,
-        )
+        result = ContextBuilder(agent_home).build_system_prompt(workspace=project)
 
         assert "selected project rules" in result
         assert "global project rules" not in result
@@ -152,10 +149,7 @@ class TestLoadBootstrapFiles:
         project.mkdir()
         (agent_home / "AGENTS.md").write_text("default workspace rules", encoding="utf-8")
 
-        result = ContextBuilder(agent_home).build_system_prompt(
-            workspace=project,
-            include_memory_recent_history=False,
-        )
+        result = ContextBuilder(agent_home).build_system_prompt(workspace=project)
 
         assert "default workspace rules" not in result
 
@@ -223,6 +217,8 @@ class TestBundledToolContract:
         assert "Use the narrowest structured tool" in content
         assert "Do not use `exec` as a universal workaround" in content
         assert "## File and Coding Workflows" in content
+        assert "`grep` returns matches with five context lines by default" in content
+        assert 'defaults to `output_mode="files_with_matches"`' not in content
         assert "apply_patch" in content
         assert "acceptance criteria into concrete checks" in content
         assert "visual evidence reaches the model" in content
@@ -309,6 +305,14 @@ class TestBuildSystemPrompt:
         result = builder.build_system_prompt()
         assert "workspace" in result.lower() or "python" in result.lower()
 
+    def test_default_identity_uses_relative_agent_paths(self, tmp_path):
+        result = ContextBuilder(tmp_path)._get_identity()
+
+        assert str(tmp_path.resolve()) not in result
+        assert "Agent profile: SOUL.md and USER.md" in result
+        assert "History log: memory/history.jsonl" in result
+        assert "Custom skills: skills/{skill-name}/SKILL.md" in result
+
     def test_selected_project_identity_keeps_agent_data_in_agent_workspace(self, tmp_path):
         agent_home = tmp_path / "agent-home"
         project = tmp_path / "project"
@@ -317,7 +321,7 @@ class TestBuildSystemPrompt:
 
         result = ContextBuilder(agent_home)._get_identity(workspace=project)
 
-        assert f"current project workspace is at: {project.resolve()}" in result
+        assert str(project.resolve()) not in result
         assert f"agent workspace is at: {agent_home.resolve()}" in result
         assert f"{agent_home.resolve()}/SOUL.md" in result
         assert f"{project.resolve()}/SOUL.md" not in result
@@ -393,6 +397,15 @@ class TestBuildMessages:
         assert "user-only runtime context" not in messages[-1]["content"]
         assert "_meta" not in messages[-1]
 
+    def test_compatibility_builder_merges_system_role_without_history(self, tmp_path):
+        builder = _builder(tmp_path)
+
+        messages = builder.build_messages([], "system event", current_role="system")
+
+        assert len(messages) == 1
+        assert messages[0]["role"] == "system"
+        assert str(messages[0]["content"]).endswith("system event")
+
     def test_explicit_skill_reference_loads_full_instructions_for_this_turn(self, tmp_path):
         skill_dir = tmp_path / "skills" / "review"
         skill_dir.mkdir(parents=True)
@@ -462,6 +475,20 @@ class TestBuildMessages:
         assert "previous user message" in str(messages[1]["content"])
         assert "new message" in str(messages[1]["content"])
 
+    def test_structured_transcript_preserves_fresh_turn_boundary(self, tmp_path):
+        builder = _builder(tmp_path)
+        transcript = TranscriptInput(
+            history=[{"role": "user", "content": "previous user message"}],
+            current_message="new message",
+        )
+
+        messages = builder.build_transcript(transcript)
+
+        assert [message["role"] for message in messages] == ["system", "user", "user"]
+        assert messages[-2]["content"] == "previous user message"
+        assert messages[-1]["content"] == "new message"
+        assert transcript.message_count == 3
+
     def test_current_message_can_be_built_without_history_merge(self, tmp_path):
         builder = _builder(tmp_path)
         current = builder.build_current_message(
@@ -491,3 +518,98 @@ class TestBuildMessages:
         user_msg = messages[-1]["content"]
         assert isinstance(user_msg, list)
         assert any(b.get("type") == "image_url" for b in user_msg)
+
+
+# ---------------------------------------------------------------------------
+# <identity_context> 标签块（design §13.3 / FR-4.3）
+# ---------------------------------------------------------------------------
+
+
+class TestIdentityContextBlock:
+    """SOUL / IDENTITY / USER 收敛进一个标签块；AGENTS.md 留在标签外。"""
+
+    def test_identity_files_are_wrapped_together(self, tmp_path):
+        (tmp_path / "SOUL.md").write_text("soul body", encoding="utf-8")
+        (tmp_path / "IDENTITY.md").write_text("identity body", encoding="utf-8")
+        (tmp_path / "USER.md").write_text("user body", encoding="utf-8")
+
+        result = _builder(tmp_path)._load_bootstrap_files()
+
+        assert "<identity_context>" in result
+        assert "</identity_context>" in result
+        block = result[result.index("<identity_context>"):]
+        for body in ("soul body", "identity body", "user body"):
+            assert body in block
+
+    def test_agents_md_stays_outside_the_tag(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("project rules", encoding="utf-8")
+        (tmp_path / "SOUL.md").write_text("soul body", encoding="utf-8")
+
+        result = _builder(tmp_path)._load_bootstrap_files()
+
+        tag_start = result.index("<identity_context>")
+        assert result.index("project rules") < tag_start
+        assert result.index("soul body") > tag_start
+
+    def test_no_tag_when_only_agents_md(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("just project rules", encoding="utf-8")
+
+        result = _builder(tmp_path)._load_bootstrap_files()
+
+        assert "## AGENTS.md" in result
+        assert "<identity_context>" not in result
+
+    def test_no_tag_when_empty(self, tmp_path):
+        assert _builder(tmp_path)._load_bootstrap_files() == ""
+
+    def test_identity_md_alone_still_wrapped(self, tmp_path):
+        (tmp_path / "IDENTITY.md").write_text("I am ReviewBot.", encoding="utf-8")
+
+        result = _builder(tmp_path)._load_bootstrap_files()
+
+        assert "<identity_context>" in result
+        assert "I am ReviewBot." in result
+
+    def test_identity_context_reaches_system_prompt(self, tmp_path):
+        (tmp_path / "SOUL.md").write_text("soul body", encoding="utf-8")
+
+        prompt = _builder(tmp_path).build_system_prompt()
+
+        assert "<identity_context>" in prompt
+        assert "soul body" in prompt
+
+    def test_bundled_identity_template_is_skipped(self, tmp_path):
+        """脚手架副本（未编辑）不注入，避免占位符烧 token。"""
+        from importlib.resources import files as pkg_files
+
+        scaffold = (pkg_files("nanobot") / "templates" / "IDENTITY.md").read_text(
+            encoding="utf-8"
+        )
+        (tmp_path / "IDENTITY.md").write_text(scaffold, encoding="utf-8")
+
+        result = _builder(tmp_path)._load_bootstrap_files()
+
+        assert "## IDENTITY.md" not in result
+        assert "<identity_context>" not in result
+
+    def test_identity_is_not_skippable_once_edited(self, tmp_path):
+        (tmp_path / "IDENTITY.md").write_text("edited identity", encoding="utf-8")
+
+        result = _builder(tmp_path)._load_bootstrap_files()
+
+        assert "## IDENTITY.md" in result
+        assert "edited identity" in result
+
+    def test_identity_md_lives_in_agent_workspace_not_project(self, tmp_path):
+        """身份文件锚定 agent workspace；项目目录里的同名文件不参与。"""
+        agent_home = tmp_path / "agent-home"
+        project = tmp_path / "project"
+        agent_home.mkdir()
+        project.mkdir()
+        (agent_home / "IDENTITY.md").write_text("agent identity", encoding="utf-8")
+        (project / "IDENTITY.md").write_text("project identity collision", encoding="utf-8")
+
+        result = ContextBuilder(agent_home).build_system_prompt(workspace=project)
+
+        assert "agent identity" in result
+        assert "project identity collision" not in result

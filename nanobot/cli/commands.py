@@ -56,6 +56,7 @@ from nanobot.cli.agent import agent  # noqa: E402
 from nanobot.cli.gateway import create_gateway_app  # noqa: E402
 from nanobot.cli.gateway_runtime import _run_gateway  # noqa: E402
 from nanobot.cli.log_control import _set_nanobot_logs  # noqa: E402
+from nanobot.cli.process_identity import set_cli_process_identity  # noqa: E402
 from nanobot.cli.provider import provider_app  # noqa: E402
 from nanobot.cli.runtime_config import (  # noqa: E402
     _load_inspection_config,
@@ -86,7 +87,12 @@ app = typer.Typer(
     name="nanobot",
     context_settings={"help_option_names": ["-h", "--help"]},
     help=f"{__logo__} nanobot - Personal AI Assistant",
-    no_args_is_help=True,
+    epilog=(
+        "Run `nanobot` without a subcommand to start the terminal agent. "
+        "Use `nanobot agent --help` for agent options."
+    ),
+    invoke_without_command=True,
+    no_args_is_help=False,
 )
 
 console = Console()
@@ -97,14 +103,23 @@ def version_callback(value: bool):
         raise typer.Exit()
 
 
-@app.callback()
+@app.callback(invoke_without_command=True)
 def main(
+    ctx: typer.Context,
     version: bool = typer.Option(
         None, "--version", "-v", callback=version_callback, is_eager=True
     ),
 ):
     """nanobot - Personal AI Assistant."""
-    pass
+    # Editable/source installs can retain an older generated console script that
+    # imports this Typer app directly instead of ``nanobot.cli.entry``. Keep the
+    # role identity correct until that launcher is regenerated.
+    command = ctx.invoked_subcommand
+    set_cli_process_identity([command] if command else ["agent"])
+    if command is None:
+        from nanobot.cli.entry import _run_agent
+
+        _run_agent([], prog_name="nanobot")
 
 
 # ============================================================================
@@ -354,7 +369,7 @@ def serve(
     sync_workspace_templates(runtime_config.workspace_path)
     bus = MessageBus()
     session_manager = SessionManager(runtime_config.workspace_path)
-    # [LOCAL PATCH] sciherd-cloud-smartagent：为 serve 进程注入 CronService，
+    # [LOCAL PATCH] nanowork：为 serve 进程注入 CronService，
     # 解锁聊天链路中的内置 cron 工具（CronTool 的 enabled 条件为
     # ctx.cron_service is not None），使用户可通过 /v1 聊天创建定时任务。
     #

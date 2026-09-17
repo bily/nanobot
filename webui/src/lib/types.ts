@@ -1,8 +1,8 @@
-export type Role = "user" | "assistant" | "tool" | "system";
+type Role = "user" | "assistant" | "tool" | "system";
 
 /** "trace" rows are intermediate agent breadcrumbs (tool-call hints,
  * progress pings) that should not be rendered as conversational replies. */
-export type MessageKind = "message" | "trace";
+type MessageKind = "message" | "trace";
 
 export type UITurnPhase = "user" | "reasoning" | "activity" | "answer" | "complete";
 export type MessageDeliveryStatus = "sending" | "accepted" | "failed";
@@ -37,7 +37,27 @@ export interface UIMediaAttachment {
   name?: string;
 }
 
-export interface UIMessageSource { kind: "cron" | "local_trigger" | "trigger" | string; label?: string; }
+interface UIMessageSource { kind: "cron" | "local_trigger" | "trigger" | string; label?: string; }
+
+export interface TurnUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cached_tokens?: number;
+  context_tokens?: number;
+  request_count?: number;
+  estimated_tokens?: number;
+  [key: string]: number | undefined;
+}
+
+export type RecoveryStatus = "resuming" | "awaiting_user" | "recovered" | "failed";
+
+export interface RecoveryState {
+  status: RecoveryStatus;
+  recovery_id: string;
+  reason?: string;
+  attempts?: number;
+  can_continue?: boolean;
+}
 
 export interface UIMessage {
   id: string;
@@ -56,6 +76,9 @@ export interface UIMessage {
   fileEdits?: UIFileEdit[];
   /** Activity rows created during the same agent phase share one collapsible block. */
   activitySegmentId?: string;
+  /** Internal projection marker for assistant text emitted before a later tool.
+   * It is not a wire message and is rendered as a compact activity row. */
+  activityKind?: "model";
   /** User turn: optimistic blob URLs for preview. Replay: placeholder chips. */
   images?: UIImage[];
   /** Signed or local UI-renderable media attachments. */
@@ -77,6 +100,10 @@ export interface UIMessage {
   latencyMs?: number;
   /** Client epoch milliseconds when the definitive ``turn_end`` was received. */
   completedAt?: number;
+  /** Additive model usage for this turn; context_tokens is the final request only. */
+  usage?: TurnUsage;
+  /** Configured context-window capacity for the model used by this turn. */
+  contextWindowTokens?: number;
   /** Lightweight provenance for proactive assistant messages. */
   source?: UIMessageSource;
   /** Structured provenance for a message delivered by another session. */
@@ -127,7 +154,7 @@ export interface SessionHandle {
   name: string;
 }
 
-export interface UISessionMessage {
+interface UISessionMessage {
   message_id: string;
   session: SessionHandle;
 }
@@ -209,14 +236,14 @@ export interface SkillSummary {
   unavailable_reason?: string;
 }
 
-export interface SkillRequirements {
+interface SkillRequirements {
   bins: string[];
   env: string[];
   missing_bins: string[];
   missing_env: string[];
 }
 
-export interface SkillInstallOption {
+interface SkillInstallOption {
   id: string;
   kind: string;
   label: string;
@@ -286,7 +313,7 @@ export interface SkillInstallPayload extends SkillsPayload {
 }
 
 /** Structured UI blob on ``progress`` WS frames; channels may add more ``kind`` values later. */
-export interface AgentUIBlob {
+interface AgentUIBlob {
   kind: string;
   data?: unknown;
 }
@@ -351,6 +378,8 @@ export interface ChatSummary {
   modelPreset?: string | null;
   /** Unix epoch seconds when this session currently has a turn in flight. */
   runStartedAt?: number | null;
+  /** Durable recovery state that needs attention after an interrupted turn. */
+  recoveryState?: RecoveryState | null;
   workspaceScope?: WorkspaceScopePayload | null;
   /** Stable, server-owned @handle for this session. */
   handle?: SessionHandle | null;
@@ -438,16 +467,16 @@ export interface BootstrapResponse {
   runtime_capabilities?: RuntimeCapabilities;
 }
 
-export interface WebUITransportLimits {
+interface WebUITransportLimits {
   max_frame_bytes: number;
   envelope_reserve_bytes: number;
 }
 
-export interface WebUIMessageLimits {
+interface WebUIMessageLimits {
   max_text_bytes: number;
 }
 
-export interface WebUIAttachmentLimits {
+interface WebUIAttachmentLimits {
   max_count: number;
   max_file_bytes: number;
   max_total_bytes: number;
@@ -460,8 +489,8 @@ export interface WebUIIngressLimits {
 }
 
 export type RuntimeSurface = "browser" | "native";
-export type RestartBehavior = "none" | "nextTurn" | "engineRestart" | "appRestart";
-export type SettingsApplyStatus =
+type RestartBehavior = "none" | "nextTurn" | "engineRestart" | "appRestart";
+type SettingsApplyStatus =
   | "idle"
   | "pending"
   | "applying"
@@ -475,7 +504,7 @@ export interface RuntimeCapabilities {
   can_export_diagnostics: boolean;
 }
 
-export interface ProviderModelInfo {
+interface ProviderModelInfo {
   id: string;
   label?: string | null;
   description?: string | null;
@@ -766,12 +795,12 @@ export interface ApiServicePayload {
   last_action?: "started" | "stopped" | string;
 }
 
-export interface AppPackageRef {
+interface AppPackageRef {
   manager: string;
   name?: string;
 }
 
-export interface AppCapability {
+interface AppCapability {
   type: "cli" | "mcp" | "skill" | string;
   entry_point?: string;
   package?: AppPackageRef;
@@ -789,20 +818,20 @@ export interface AppCapability {
   }>;
 }
 
-export interface AppPlan {
+interface AppPlan {
   supported: boolean;
   strategy?: string;
   managed_paths?: string[];
   verification?: string[];
 }
 
-export interface AppTrust {
+interface AppTrust {
   registry: string;
   level: string;
   review_status: string;
 }
 
-export interface AppManifest {
+interface AppManifest {
   schema: "agent-app.v1" | string;
   id: string;
   display_name: string;
@@ -918,7 +947,7 @@ export interface NanobotFeaturesPayload {
   };
 }
 
-export type ChannelSetupStatus =
+type ChannelSetupStatus =
   | "connected"
   | "configured"
   | "needs_setup"
@@ -926,9 +955,9 @@ export type ChannelSetupStatus =
   | "unsupported"
   | string;
 
-export type ChannelValidationCheckStatus = "pass" | "warn" | "fail" | "skipped" | string;
+type ChannelValidationCheckStatus = "pass" | "warn" | "fail" | "skipped" | string;
 
-export interface ChannelValidationCheck {
+interface ChannelValidationCheck {
   id: string;
   label: string;
   status: ChannelValidationCheckStatus;
@@ -936,7 +965,7 @@ export interface ChannelValidationCheck {
   action_url?: string;
 }
 
-export interface ChannelIdentity {
+interface ChannelIdentity {
   name?: string;
   workspace?: string;
   account?: string;
@@ -976,7 +1005,7 @@ export interface PairingPayload {
   };
 }
 
-export interface McpPresetField {
+interface McpPresetField {
   name: string;
   label: string;
   secret: boolean;
@@ -1016,7 +1045,7 @@ export interface McpPresetInfo {
   manifest?: AppManifest;
 }
 
-export type McpOAuthFlowStatus =
+type McpOAuthFlowStatus =
   | "starting"
   | "authorization_required"
   | "connecting"
@@ -1072,7 +1101,7 @@ export interface McpPresetsPayload {
   };
 }
 
-export type ChannelConnectStatus = "pending" | "succeeded" | "expired" | "cancelled" | "failed";
+type ChannelConnectStatus = "pending" | "succeeded" | "expired" | "cancelled" | "failed";
 
 export interface ChannelConnectPayload {
   session_id: string;
@@ -1217,7 +1246,7 @@ export type ConnectionStatus =
   | "closed"
   | "error";
 
-export interface InboundTurnMetadata {
+interface InboundTurnMetadata {
   turn_id?: string;
   turn_phase?: UITurnPhase;
   turn_seq?: number;
@@ -1225,7 +1254,13 @@ export interface InboundTurnMetadata {
 
 export type InboundEvent =
   | { event: "ready"; chat_id: string; client_id: string }
-  | { event: "attached"; chat_id: string; temporary?: boolean }
+  | {
+      event: "attached";
+      chat_id: string;
+      temporary?: boolean;
+      recovery_state?: RecoveryState;
+      usage?: TurnUsage;
+    }
   | {
       event: "message_accepted";
       chat_id: string;
@@ -1267,6 +1302,10 @@ export type InboundEvent =
       /** Optional structured payload on progress frames (channel-specific). */
       agent_ui?: AgentUIBlob;
     } & InboundTurnMetadata)
+  | ({
+      event: "recovery_state";
+      chat_id: string;
+    } & RecoveryState)
   | ({
       event: "file_edit";
       chat_id: string;
@@ -1313,11 +1352,14 @@ export type InboundEvent =
       chat_id: string;
       model_name: string;
       model_preset?: string | null;
+      fallback?: boolean;
     }
   | ({
       event: "turn_end";
       chat_id: string;
       latency_ms?: number;
+      usage?: TurnUsage;
+      context_window_tokens?: number;
       /** Authoritative sustained-goal snapshot for this chat (same shape as ``goal_state`` events). */
       goal_state?: GoalStateWsPayload;
     } & InboundTurnMetadata)
@@ -1405,7 +1447,7 @@ export interface OutboundMcpPresetMention {
 }
 
 /** Response shape for ``GET .../webui-thread`` (server-built transcript replay). */
-export interface WebuiThreadPagePayload {
+interface WebuiThreadPagePayload {
   before_cursor?: string | null;
   has_more_before?: boolean;
   loaded_message_count?: number;

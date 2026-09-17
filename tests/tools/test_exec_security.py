@@ -30,7 +30,7 @@ def _fake_resolve_public(hostname, port, family=0, type_=0):
 
 @pytest.mark.asyncio
 async def test_exec_blocks_curl_metadata():
-    tool = ExecTool()
+    tool = ExecTool(restrict_to_workspace=True)
     with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_private):
         result = await tool.execute(
             command='curl -s -H "Metadata-Flavor: Google" http://169.254.169.254/computeMetadata/v1/'
@@ -41,7 +41,7 @@ async def test_exec_blocks_curl_metadata():
 
 @pytest.mark.asyncio
 async def test_exec_blocks_wget_localhost():
-    tool = ExecTool()
+    tool = ExecTool(restrict_to_workspace=True)
     with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_localhost):
         result = await tool.execute(command="wget http://localhost:8080/secret -O /tmp/out")
     assert "Error" in result
@@ -111,6 +111,40 @@ def test_exec_full_workspace_scope_still_blocks_metadata(tmp_path):
     assert "internal/private" in error
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo blocked",
+        "echo http://169.254.169.254/latest/meta-data/",
+    ],
+)
+async def test_exec_full_access_skips_command_guard(tmp_path, command):
+    tool = ExecTool(
+        working_dir=str(tmp_path),
+        restrict_to_workspace=False,
+        deny_patterns=[r"echo\s+blocked"],
+    )
+    result = await tool.execute(command=command)
+
+    assert "Exit code: 0" in result
+    assert "Command blocked" not in result
+
+
+async def test_exec_full_workspace_scope_skips_command_guard(tmp_path):
+    tool = ExecTool(working_dir=str(tmp_path), restrict_to_workspace=True)
+    scope = build_workspace_scope(tmp_path, "full", source_channel="websocket")
+    token = bind_workspace_scope(scope)
+    try:
+        result = await tool.execute(
+            command="echo http://169.254.169.254/latest/meta-data/",
+        )
+    finally:
+        reset_workspace_scope(token)
+
+    assert "Exit code: 0" in result
+    assert "Command blocked" not in result
+
+
 @pytest.mark.asyncio
 async def test_exec_allows_normal_commands():
     tool = ExecTool(timeout=5)
@@ -131,7 +165,7 @@ async def test_exec_allows_curl_to_public_url():
 @pytest.mark.asyncio
 async def test_exec_blocks_chained_internal_url():
     """Internal URLs buried in chained commands should still be caught."""
-    tool = ExecTool()
+    tool = ExecTool(restrict_to_workspace=True)
     with patch("nanobot.security.network.socket.getaddrinfo", _fake_resolve_private):
         result = await tool.execute(
             command="echo start && curl http://169.254.169.254/latest/meta-data/ && echo done"
@@ -262,8 +296,11 @@ async def test_exec_ignores_workspace_check_when_not_restricted(tmp_path):
 @pytest.mark.parametrize(
     "command",
     [
-        # The exact command from the #3599 reporter.
-        'rm test_print.txt 2>/dev/null; echo "done"',
+        # [LOCAL PATCH] nanowork FR-8.3：这里原本还有 #3599 报障者的原句
+        # `rm test_print.txt 2>/dev/null; echo "done"`，断言它被放行。
+        # nanowork 刻意推翻了该契约——**shell 删除一律拦下并指回 delete_file**
+        # （删除必须能进系统回收站，`rm` 做不到）。该命令的覆盖移到了
+        # `test_shell_delete_is_intercepted_even_with_dev_null_redirect`。
         # Plain redirect of stdout / stderr.
         "find . -type f >/dev/null",
         "noisy_cmd 2>/dev/null",
@@ -284,10 +321,36 @@ def test_exec_allows_benign_device_targets_inside_workspace(tmp_path, command):
     assert tool._guard_command(command, str(workspace)) is None
 
 
+def test_shell_delete_is_intercepted_even_with_dev_null_redirect(tmp_path):
+    """[LOCAL PATCH] nanowork FR-8.3：#3599 的「rm 应放行」契约已被刻意推翻。
+
+    上游关心的是「`2>/dev/null` 这个重定向不该触发工作空间越界告警」；nanowork
+    关心的是**删除本身**必须能进回收站，而 ``rm`` 做不到。两条需求叠在一起，
+    结论就是：这条命令必须被拦下，且拦截原因必须指向 ``delete_file`` 而不是
+    「路径越界」——否则模型会以为路径写错了，从而换个路径重试，而不是改道。
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tool = ExecTool(working_dir=str(workspace), restrict_to_workspace=True)
+
+    blocked = tool._guard_command(
+        'rm test_print.txt 2>/dev/null; echo "done"', str(workspace)
+    )
+    assert blocked is not None
+    assert "delete_file" in blocked
+    # 关键是别把它误报成路径越界——那会让模型去改路径而不是改工具。
+    assert "outside working dir" not in blocked
+
+
 @pytest.mark.asyncio
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX rm and /dev/null syntax")
 async def test_exec_3599_regression_rm_with_dev_null_redirect(tmp_path):
-    """#3599: ``rm <ws-path> 2>/dev/null`` must succeed against the workspace guard."""
+    """[LOCAL PATCH] nanowork FR-8.3：#3599 的命令现在必须被**拦下**。
+
+    上游断言「``rm <ws-path> 2>/dev/null`` 应当成功」。nanowork 下这条命令
+    不该成功——删除要么走 ``delete_file``（进回收站），要么不做。这里同时钉住
+    两件事：命令被拒（重定向语法不影响判定），且文件**原封不动**。
+    """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     target = workspace / "test_print.txt"
@@ -297,9 +360,11 @@ async def test_exec_3599_regression_rm_with_dev_null_redirect(tmp_path):
         command=f'rm {target} 2>/dev/null; echo "done"',
         working_dir=str(workspace),
     )
-    assert "done" in result
-    assert "path outside working dir" not in result
-    assert not target.exists()
+    assert "delete_file" in result
+    assert "outside working dir" not in result
+    # fail-closed：被拦下就必须什么都没删掉。
+    assert target.exists()
+    assert target.read_text() == "scratch"
 
 
 def test_exec_still_blocks_real_outside_path_via_redirect(tmp_path):

@@ -75,6 +75,16 @@ Always strip these bracketed tags from saved memory content.
 - Active project context still referenced in conversations
 - Behavioral rules in SOUL.md
 
+## Never record
+
+Do not write any of the following to MEMORY.md, USER.md, SOUL.md, or SKILL.md — they are session-scoped runtime values, not durable facts. Recording one makes the agent act on a stale location in every later session:
+
+- The current working directory, or any statement about where files "are" / "should be" written (e.g. `Current working directory: D:\test`, "项目目录在 …"). The running agent already receives the real working directory from the runtime on every turn; durable memory must never contradict it.
+- Drive letters or absolute machine paths tied to the machine the session happened to run on. Keep project paths only when they are genuinely stable and meaningful (e.g. "the repo lives in `packages/map`"), never as a bare absolute directory.
+- Today's date, the current time, temporary file locations, or the identity of the currently open window/tab.
+
+If MEMORY.md already contains such an entry, delete it — it is stale by definition.
+
 **Age and decay rules:**
 - Sprint goals and milestones: keep current + next sprint; archive completed ones after 30 days
 - Architecture decisions: keep indefinitely unless explicitly superseded

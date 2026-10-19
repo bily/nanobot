@@ -18,6 +18,11 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 from aiohttp import web
 from loguru import logger
 
+from nanobot.agent.expert_group import (
+    EXPERT_GROUP_METADATA_KEY,
+    ExpertGroupError,
+    parse_expert_group,
+)
 from nanobot.agent.hook import AgentHook, AgentRunHookContext
 from nanobot.config.paths import get_media_dir
 from nanobot.providers.base import LLMUsage
@@ -54,6 +59,7 @@ __all__ = (
     "handle_plugin_action",
     "handle_plugins",
     "handle_tool_approval",
+    "handle_usage",
 )
 
 
@@ -61,6 +67,9 @@ API_SESSION_KEY = "api:default"
 API_CHAT_ID = "default"
 _AGENT_LOOP_KEY = web.AppKey[Any]("agent_loop")
 _MODEL_NAME_KEY = web.AppKey[str]("model_name")
+# [LOCAL PATCH] nanowork：热加载要知道配置**文件**在哪——运行中的 loop 持有的是启动时
+# 那个 Config 对象，不从磁盘重读就永远看不到客户端刚写进去的模型。
+_CONFIG_PATH_KEY = web.AppKey[str | None]("config_path")
 _REQUEST_TIMEOUT_KEY = web.AppKey[float]("request_timeout")
 _SESSION_LOCKS_KEY = web.AppKey[dict[str, asyncio.Lock]]("session_locks")
 _PREPARE_AGENT_KEY = web.AppKey[Callable[[], Awaitable[None]] | None]("prepare_agent")
@@ -212,6 +221,33 @@ def _sse_chunk(delta: str, model: str, chunk_id: str, finish_reason: str | None 
 
 _SSE_DONE = b"data: [DONE]\n\n"
 
+
+def _finish_reason_for(stop_reason: object) -> str:
+    """把引擎内部的 ``stop_reason`` 映射成 OpenAI 兼容的 ``finish_reason``。
+
+    OpenAI 只认 ``stop`` / ``length`` / ``tool_calls`` / ``function_call`` /
+    ``content_filter``。映射口径是**保守但不说谎**：本轮实际报错、或撞上迭代上限时
+    都不能再报 ``stop`` —— 客户端会据此判断这一轮是否正常收尾，把失败报成成功正是
+    2026-09-29 断流事故被渲染成「已完成」的一半原因。
+
+    Args:
+        stop_reason: 引擎 turn 的结束原因（``ctx.stop_reason``，经 outbound metadata
+            的 ``_stop_reason`` 透出）。未知值、缺失、非字符串一律按 ``stop`` 处理：
+            这是历史行为，也是唯一的「不改变既有语义」的选择。
+
+    Returns:
+        OpenAI 兼容的 finish_reason 字符串。
+    """
+    if not isinstance(stop_reason, str):
+        return "stop"
+    if stop_reason in {"error", "tool_error"}:
+        return "error"
+    if stop_reason == "max_iterations":
+        # 迭代预算耗尽 = 这一轮没能收尾，语义上等价于「输出没写完」
+        return "length"
+    return "stop"
+
+
 # ---------------------------------------------------------------------------
 # Upload helpers
 # ---------------------------------------------------------------------------
@@ -289,11 +325,16 @@ async def _parse_multipart(
     str | None,
     str | None,
     str | None,
+    str | None,
+    str | None,
 ]:
     """Parse multipart/form-data.
 
     Returns (text, media_paths, session_id, model, workspace, access_mode,
-    approval_mode, session_mode, agent_id, tool_allow, tool_deny).
+    approval_mode, session_mode, agent_id, tool_allow, tool_deny, expert_group).
+
+    ``expert_group`` 是 JSON 串（multipart 无嵌套对象），由调用方 ``json.loads``
+    还原成 dict；空/缺省为 ``None``。
     """
     media_dir = get_media_dir("api")
     reader = await request.multipart()
@@ -309,6 +350,8 @@ async def _parse_multipart(
     agent_id = None
     tool_allow = None
     tool_deny = None
+    # [LOCAL PATCH] FR-2.4：专家团清单以 JSON 串承载（multipart 无嵌套对象）。
+    expert_group_raw: str | None = None
     media_paths: list[str] = []
 
     while True:
@@ -338,6 +381,9 @@ async def _parse_multipart(
             tool_allow = (await part.read()).decode("utf-8").strip()
         elif part.name == "tool_deny":
             tool_deny = (await part.read()).decode("utf-8").strip()
+        elif part.name == "expert_group":
+            # [LOCAL PATCH] FR-2.4：JSON 串，形状校验交给后续的 parse_expert_group。
+            expert_group_raw = (await part.read()).decode("utf-8").strip() or None
         elif part.name == "files":
             raw = await part.read()
             if len(raw) > MAX_FILE_SIZE:
@@ -365,6 +411,7 @@ async def _parse_multipart(
         agent_id,
         tool_allow,
         tool_deny,
+        expert_group_raw,
     )
 
 
@@ -397,6 +444,8 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
     agent_id: str | None = None
     tool_allow: Any = None
     tool_deny: Any = None
+    # [LOCAL PATCH] FR-2.4：专家团成员清单（仅 JSON 请求体支持；multipart 不带）。
+    expert_group_payload: Any = None
     try:
         if content_type.startswith("multipart/"):
             (
@@ -411,7 +460,15 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                 agent_id,
                 tool_allow,
                 tool_deny,
+                expert_group_raw,
             ) = await _parse_multipart(request)
+            # [LOCAL PATCH] FR-2.4：multipart 无嵌套对象，专家团清单以 JSON 串传入，
+            # 这里还原成 dict；坏 JSON 直接 400（与形状非法同款，不静默降级）。
+            if expert_group_raw:
+                try:
+                    expert_group_payload = _json.loads(expert_group_raw)
+                except ValueError:
+                    return _error_json(400, "Invalid expert_group JSON")
         else:
             try:
                 body = await request.json()
@@ -449,6 +506,7 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                 tool_allow = body.get("tool_allow")
             if body.get("tool_deny") is not None:
                 tool_deny = body.get("tool_deny")
+            expert_group_payload = body.get("expert_group")
     except ValueError as e:
         return _error_json(400, str(e))
     except _FileSizeExceeded as e:
@@ -500,6 +558,16 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
             except WorkspaceScopeError as e:
                 return _error_json(400, f"Invalid workspace scope: {e}")
             request_metadata = {WORKSPACE_SCOPE_METADATA_KEY: scope_payload}
+
+    # [LOCAL PATCH] FR-2.4 专家团：形状非法直接 400。静默忽略会让「专家团」悄悄退化成
+    # 普通一轮对话——不报错、界面上也看不出来，比直接报错难查得多。
+    if expert_group_payload is not None:
+        try:
+            parse_expert_group(expert_group_payload)
+        except ExpertGroupError as e:
+            return _error_json(400, f"Invalid expert_group: {e}")
+        request_metadata = dict(request_metadata or {})
+        request_metadata[EXPERT_GROUP_METADATA_KEY] = expert_group_payload
 
     # [LOCAL PATCH] 请求级模型解析：preset 名走配置预设，裸模型名走当前 provider 覆盖；
     # 仅作用于本次请求，不改动网关默认选择。空值跟随配置默认。
@@ -566,11 +634,57 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
             reasoning_end: bool = False,
             approval_request: dict[str, Any] | None = None,
             plan: dict[str, Any] | None = None,
+            member: dict[str, Any] | None = None,
+            member_event: str | None = None,
+            member_extra: dict[str, Any] | None = None,
+            subagent: dict[str, Any] | None = None,
+            subagent_event: str | None = None,
+            subagent_extra: dict[str, Any] | None = None,
             **_kw: Any,
         ) -> None:
             # [LOCAL PATCH] 将 Agent 进度事件注入 SSE 流（delta.nanobot_event），
             # 供客户端消息流渲染「深度思考 / 工具执行」过程时间线。
             # tool_hint 文本行由客户端按 tool_events 自行渲染，此处不下发。
+            if subagent and subagent_event:
+                # [LOCAL PATCH] FR-2.5 第 4 步：子代理生命周期事件。
+                # 与专家团成员事件同形，客户端据此渲染「子代理分组」行；否则一次
+                # spawn 只能显示成一个黑箱工具调用，用户看不到它到底在干什么。
+                # 透传载荷先展开、固定键后覆盖：归属字段是契约，不允许被载荷改写。
+                await queue.put(
+                    _sse_delta(
+                        {
+                            "nanobot_event": {
+                                **dict(subagent_extra or {}),
+                                "kind": "subagent",
+                                "subagent": subagent,
+                                "subagent_event": subagent_event,
+                            }
+                        },
+                        reported_model,
+                        chunk_id,
+                    )
+                )
+                return
+            if member and member_event:
+                # [LOCAL PATCH] FR-2.4 第 3 步：专家团成员生命周期。
+                # 客户端靠这两个字段把过程事件归到「成员 A / 成员 B」名下，
+                # 否则一次多成员编排只能显示成一轮黑箱。
+                # 透传载荷先展开、固定键后覆盖：归属字段是契约，不允许被载荷里的同名键改写。
+                await queue.put(
+                    _sse_delta(
+                        {
+                            "nanobot_event": {
+                                **dict(member_extra or {}),
+                                "kind": "member",
+                                "member": member,
+                                "member_event": member_event,
+                            }
+                        },
+                        reported_model,
+                        chunk_id,
+                    )
+                )
+                return
             if approval_request:
                 # 工具调用此时阻塞在引擎的 before_execute_tool 里等裁决，
                 # 客户端拿到 id 后走 POST /v1/tool-approvals/{id} 回传。
@@ -632,8 +746,12 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
             # HTTP SSE stream is closed only when process_direct returns.
             return None
 
+        # 本轮真实的终结原因：由 process_direct 返回的 outbound metadata 透出
+        # （见 AgentLoop._prepare_outbound 写入的 `_stop_reason`）。拿不到时退回 "stop"。
+        finish_reason = "stop"
+
         async def _run() -> None:
-            nonlocal stream_failed
+            nonlocal stream_failed, finish_reason
             try:
                 async with session_lock:
                     async with asyncio.timeout(timeout_s):
@@ -650,6 +768,9 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                             runtime=runtime,
                             metadata=request_metadata,
                         )
+                    finish_reason = _finish_reason_for(
+                        (getattr(response, "metadata", None) or {}).get("_stop_reason")
+                    )
                     if not emitted_content:
                         response_text = _response_text(response)
                         if response_text.strip():
@@ -673,9 +794,14 @@ async def handle_chat_completions(request: web.Request) -> web.Response | web.St
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
 
-        if not stream_failed:
-            await resp.write(_sse_chunk("", reported_model, chunk_id, finish_reason="stop"))
-            await resp.write(_SSE_DONE)
+        if stream_failed:
+            # 中途失败：**不写** [DONE]（客户端据此判定这次是异常结束），但补一个终结帧
+            # 把原因说清楚。旧实现是静默关闭 body，客户端只看到「流没了」，与正常收尾
+            # 完全同形——2026-09-29 的断流就是这样被渲染成「已完成」的。
+            await resp.write(_sse_chunk("", reported_model, chunk_id, finish_reason="error"))
+            return resp
+        await resp.write(_sse_chunk("", reported_model, chunk_id, finish_reason=finish_reason))
+        await resp.write(_SSE_DONE)
         return resp
 
     # -- non-streaming path (original logic) --
@@ -784,8 +910,11 @@ async def handle_tool_approval(request: web.Request) -> web.Response:
     body_data: dict[str, Any] = cast(dict[str, Any], body) if body else {}
 
     raw_decision = _as_str(body_data.get("decision") or "").strip().lower()
-    if raw_decision not in ("allow", "deny"):
-        return _error_json(400, "decision must be 'allow' or 'deny'")
+    # ``always`` = 「本会话内不再询问这个工具」。它是一次性放行的**更强**形态，
+    # 因此必须出现在协议白名单里，不能靠客户端把它翻译成 ``allow``——那样
+    # 引擎永远学不会「别再问了」，用户每轮都要点一遍。
+    if raw_decision not in ("allow", "deny", "always"):
+        return _error_json(400, "decision must be 'allow', 'deny' or 'always'")
     reason = _as_str(body_data.get("reason") or "").strip()
 
     pending = PENDING_APPROVALS.get(request_id)
@@ -804,6 +933,97 @@ async def handle_tool_approval(request: web.Request) -> web.Response:
     return web.json_response(
         {"ok": True, "id": request_id, "decision": raw_decision}
     )
+
+
+async def handle_dream_review(request: web.Request) -> web.Response:
+    """GET /v1/dream/review — surface the pending Dream candidate for the review UI.
+
+    [LOCAL PATCH] nanowork FR-4.6：客户端审查页从这里拿候选 diff。
+    没有候选时返回 ``{"pending": false}``，避免客户端空轮询报错。
+    """
+    workspace = _plugin_workspace(request)
+    if workspace is None:
+        return _error_json(503, "Agent workspace is unavailable")
+    from nanobot.agent.memory import MemoryStore
+
+    store = MemoryStore(workspace)
+    if not store.has_dream_candidate():
+        return web.json_response({"pending": False, "diff": {}})
+    return web.json_response({"pending": True, "diff": store.compute_dream_candidate_diff()})
+
+
+async def handle_dream_accept(request: web.Request) -> web.Response:
+    """POST /v1/dream/accept — write the accepted candidate back to the real memory files.
+
+    [LOCAL PATCH] nanowork FR-4.6：采纳。只在候选内容确实变化时才触碰正式文件
+    （``accept_dream_candidate`` 内部已逐字节比对），并留下审计提交。
+    """
+    workspace = _plugin_workspace(request)
+    if workspace is None:
+        return _error_json(503, "Agent workspace is unavailable")
+    from nanobot.agent.memory import MemoryStore
+
+    store = MemoryStore(workspace)
+    if not store.has_dream_candidate():
+        return _error_json(409, "No Dream candidate is pending review")
+    changed = store.accept_dream_candidate()
+    return web.json_response({"ok": True, "updated": changed})
+
+
+async def handle_dream_reject(request: web.Request) -> web.Response:
+    """POST /v1/dream/reject — discard the pending Dream candidate.
+
+    [LOCAL PATCH] nanowork FR-4.6：丢弃。``reject_dream_candidate`` 永远不碰正式文件。
+    """
+    workspace = _plugin_workspace(request)
+    if workspace is None:
+        return _error_json(503, "Agent workspace is unavailable")
+    from nanobot.agent.memory import MemoryStore
+
+    store = MemoryStore(workspace)
+    if not store.has_dream_candidate():
+        return _error_json(409, "No Dream candidate is pending review")
+    store.reject_dream_candidate()
+    return web.json_response({"ok": True})
+
+
+# [LOCAL PATCH] nanowork：配置热加载端点（FR「保存即生效」）。
+#
+# 背景：客户端在设置里加/删模型是**写配置文件**，而运行中的引擎把 modelPresets 装配成
+# 启动时的快照（且快照 loader 闭包住那个 Config 对象）。以前唯一的生效手段是重启网关，
+# 于是 UI 只能提示「保存后自动重启网关」——用户明确要求配置变更立刻生效。
+async def handle_config_reload(request: web.Request) -> web.Response:
+    """POST /v1/config/reload — 重新读盘并热替换模型装配，不重启进程。
+
+    配置解析失败一律 400 且**保持现有装配不动**：半套配置比旧配置更糟。
+    """
+    config_path = _app_value(request.app, _CONFIG_PATH_KEY, "config_path", None)
+    if not config_path:
+        return _error_json(503, "Gateway was started without a config file path")
+    agent_loop = _app_value(request.app, _AGENT_LOOP_KEY, "agent_loop", None)
+    if agent_loop is None:
+        return _error_json(503, "Agent loop is not available")
+
+    from nanobot.config.loader import load_config
+
+    try:
+        config = load_config(Path(config_path))
+    except Exception as exc:  # 配置写坏了：明确回错，别让服务崩在半路
+        return _error_json(400, f"Failed to load config: {exc}", "invalid_config")
+
+    reload_fn = getattr(agent_loop, "reload_runtime_config", None)
+    if reload_fn is None:
+        return _error_json(501, "This engine does not support config hot reload")
+    try:
+        reload_fn(config)
+    except Exception as exc:
+        return _error_json(400, f"Failed to apply config: {exc}", "invalid_config")
+
+    # `getattr` 兜底：拿不到目录时回空列表而不是 500——这个端点的价值就是「保存后
+    # 立刻能看到新列表」，它读不到目录不该让整个保存流程崩掉（客户端仍会重拉
+    # `/v1/models`，那边拿的是同一份装配）。
+    presets = getattr(agent_loop, "model_presets", None) or {}
+    return web.json_response({"ok": True, "models": sorted(presets)})
 
 
 def _plugin_workspace(request: web.Request) -> Path | None:
@@ -851,6 +1071,9 @@ async def handle_plugins(request: web.Request) -> web.Response:
                     "category": plugin.category,
                     "enabled": plugin.enabled,
                     "mcpServers": list(plugin.mcp_servers),
+                    # [LOCAL PATCH] FR-3.8：来源与版本。本地平铺安装两者都是 None。
+                    "market": plugin.market,
+                    "version": plugin.version,
                 }
                 for plugin in plugins
             ],
@@ -906,6 +1129,52 @@ async def handle_plugin_action(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "name": name, "enabled": action == "enable"})
 
 
+def _usage_timezone_name() -> str | None:
+    """引擎配置里的时区名；读不到就返回 ``None``（store 会回退 UTC）。
+
+    刻意**不缓存**：设置页改完时区，报表应当立刻按新时区分组。
+    也刻意走 ``load_config`` 而不是手解 JSON —— 后者会绕过 ``$ENV`` 插值这类
+    语义，得到一个「看着像、实际不等价」的时区，而按日分组错一天是查不出来的。
+    """
+    try:
+        from nanobot.config.loader import load_config
+
+        defaults = load_config().agents.defaults
+        return getattr(defaults, "timezone", None) or None
+    except Exception:
+        logger.warning("usage: 读取引擎时区失败，按 UTC 分组", exc_info=True)
+        return None
+
+
+async def handle_usage(request: web.Request) -> web.Response:
+    """GET /v1/usage — 本机 LLM 用量聚合（nanowork FR-11.1）。
+
+    [LOCAL PATCH] nanowork：客户端「用量」页只渲染、不重算。
+
+    为什么不把聚合挪到客户端：口径全都写在 ``nanobot.llm_usage`` 里 —— 按
+    **本地日**分组、30 天窗口、连续使用天数、缓存命中率的分母（只算「缓存
+    真的被观测到」的那些请求）。复制一份到渲染层就是两份真相，引擎这边改一次，
+    客户端就会静默偏一次，而且偏的是数字，不是报错。
+
+    因此这里连 ``days`` 都不裁剪：客户端拿到完整窗口（默认 371 天）后自行切片，
+    切换时间范围不需要再请求。
+
+    只读语义：**不写入任何调用记录**。但要说清楚 —— 库还不存在时
+    ``usage_payload`` 会建立一个空库（它内部第一步 ``_connect`` 就要
+    ``CREATE TABLE IF NOT EXISTS``，这是引擎既有行为，不是本路由加的）；
+    所以「打开用量页会凭空多出一个空 ``llm_usage.sqlite3``」是预期内的，
+    与「有没有真的用过模型」无关。
+    """
+    from nanobot.llm_usage import llm_usage_payload
+
+    return web.json_response(
+        await asyncio.to_thread(
+            llm_usage_payload,
+            timezone_name=_usage_timezone_name(),
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -917,6 +1186,7 @@ def create_app(
     request_timeout: float = 120.0,
     api_key: str = "",
     prepare_agent: Callable[[], Awaitable[None]] | None = None,
+    config_path: str | None = None,
 ) -> web.Application:
     """Create the aiohttp application.
 
@@ -926,10 +1196,12 @@ def create_app(
         request_timeout: Per-request timeout in seconds.
         api_key: Optional API key for Bearer-token authentication on API routes.
         prepare_agent: Optional application-owned readiness callback run before each turn.
+        config_path: [LOCAL PATCH] 配置文件路径，供 `POST /v1/config/reload` 热加载用。
     """
     app = web.Application(client_max_size=20 * 1024 * 1024)  # 20MB for base64 images
     app[_AGENT_LOOP_KEY] = agent_loop
     app[_MODEL_NAME_KEY] = model_name
+    app[_CONFIG_PATH_KEY] = config_path
     app[_REQUEST_TIMEOUT_KEY] = request_timeout
     app[_SESSION_LOCKS_KEY] = {}  # per-user locks, keyed by session_key
     app[_PREPARE_AGENT_KEY] = prepare_agent
@@ -961,5 +1233,14 @@ def create_app(
     # 引擎是激活状态的唯一权威（指纹绑定的标记文件），客户端只读不复制哈希。
     app.router.add_get("/v1/plugins", handle_plugins)
     app.router.add_post("/v1/plugins/{name}", handle_plugin_action)
+    # [LOCAL PATCH] nanowork FR-11.1：本机 LLM 用量聚合（只读）。
+    # 报表的口径留在引擎（llm_usage），客户端只渲染，不重算。
+    app.router.add_get("/v1/usage", handle_usage)
+    # [LOCAL PATCH] nanowork FR-4.6：Dream 审查闸门客户端入口（候选 diff + 采纳/丢弃）。
+    app.router.add_get("/v1/dream/review", handle_dream_review)
+    app.router.add_post("/v1/dream/accept", handle_dream_accept)
+    app.router.add_post("/v1/dream/reject", handle_dream_reject)
+    # [LOCAL PATCH] nanowork：模型增删改后热加载，让「保存」立刻生效而不必重启网关。
+    app.router.add_post("/v1/config/reload", handle_config_reload)
     app.router.add_get("/health", handle_health)
     return app

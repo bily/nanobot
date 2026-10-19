@@ -401,6 +401,15 @@ class CronService:
                         "originChannel": j.payload.origin_channel,
                         "originChatId": j.payload.origin_chat_id,
                         "originMetadata": j.payload.origin_metadata,
+                        # [LOCAL PATCH] FR-5.6 结果推送。⚠️ 本函数是**逐字段**序列化：
+                        # 漏掉一个键就等于引擎每次落盘都把它丢掉，而且完全静默。
+                        # 缺省时**不写键**（写 `null` 会让前端那次幂等合并的比对
+                        # 在「有键 null」与「没键」之间来回抖）。
+                        **(
+                            {"delivery": j.payload.delivery.to_store_dict()}
+                            if j.payload.delivery is not None
+                            else {}
+                        ),
                     },
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,

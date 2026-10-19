@@ -83,6 +83,11 @@ def test_persisted_webui_session_prefix_has_one_production_owner() -> None:
     for path in (_REPOSITORY_ROOT / "nanobot").rglob("*.py"):
         if "tests" in path.parts or path == _SESSION_IDENTITY_PATH:
             continue
+        # [LOCAL PATCH] 排除虚拟环境与第三方包：仓库根下既有 `nanobot/.venv`，第三方
+        # 代码里出现 "websocket:" 会被算成「生产代码里多了一个 prefix owner」，
+        # 于是这条守卫恒红，跟被测属性无关。
+        if ".venv" in path.parts or "site-packages" in path.parts:
+            continue
         if "websocket:" in path.read_text(encoding="utf-8"):
             owners.append(path.relative_to(_REPOSITORY_ROOT).as_posix())
     assert owners == []

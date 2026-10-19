@@ -81,6 +81,37 @@ class ToolCallRequest:
         runtime_name = cast(object, self.name)
         return isinstance(runtime_name, str) and bool(runtime_name)
 
+    def has_usable_arguments(self) -> bool:
+        """Whether this call carries arguments the registry can actually execute.
+
+        ``parse_tool_arguments`` deliberately preserves malformed payloads as raw
+        strings instead of guessing: a JSON object string becomes a dict, an empty
+        string becomes a no-arg call, and anything that fails to parse (or parses
+        to a non-object such as an array/scalar) stays a string. A non-empty raw
+        string therefore means "the model's arguments were not a JSON object" — in
+        practice almost always a payload **cut off by the output token limit**,
+        because a truncated JSON object never parses.
+
+        Such a call cannot be executed, and it is worse than useless in history:
+        ``tool_arguments_object_for_replay`` repairs the fragment with
+        ``json_repair`` and replays fabricated parameters on every later turn.
+        Mirrors ``has_valid_name`` so the runner can drop both degenerate shapes in
+        one place (see ``AgentRunner._drop_malformed_tool_calls``).
+        """
+        runtime_arguments = cast(object, self.arguments)
+        if runtime_arguments is None or isinstance(runtime_arguments, dict):
+            return True
+        if not isinstance(runtime_arguments, str):
+            return False
+        stripped = runtime_arguments.strip()
+        if not stripped:
+            return True  # 空串 = 无参调用，合法
+        try:
+            parsed = json.loads(stripped)
+        except Exception:
+            return False
+        return isinstance(parsed, dict)
+
     def to_openai_tool_call(self) -> dict[str, Any]:
         """Serialize to an OpenAI-style tool_call payload."""
         arguments = (

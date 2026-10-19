@@ -57,6 +57,14 @@ class LLMRuntime:
             snapshot_signature=snapshot_signature,
         )
 
+    def with_model(self, model: str) -> LLMRuntime:
+        """[LOCAL PATCH] FR-2.4：派生一个换模型的 runtime。
+
+        模型只住在这里——不在 `spawn` / `run_inline` 上再加一个 `model` 参数，
+        否则「这一轮用什么模型」就有了两个可写的地方，迟早会不一致。
+        """
+        return replace(self, model=model)
+
     def with_generation_overrides(
         self,
         *,

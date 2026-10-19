@@ -42,6 +42,7 @@
 - Use `apply_patch dry_run=true` when the patch is uncertain and you want validation plus a change summary before writing.
 - Use `edit_file` only for small exact replacements in one file, with `old_text` copied from `read_file`.
 - Use `write_file` for new files or intentional full-file rewrites, not routine partial edits.
+- Keep a single `write_file` call under ~48000 characters of content: a longer argument is cut off by the output token limit before the tool can read it, and the call is rejected as malformed. For a larger file, write it in chunks — call `write_file` once with the first part, then repeat with `append=true` for each remaining part.
 - If `apply_patch` or `edit_file` fails, re-read with `force=true`, narrow the context, and try a smaller patch rather than switching to shell `sed` or `echo`.
 
 ## Process Execution

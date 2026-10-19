@@ -2,6 +2,7 @@
 
 import asyncio
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -225,3 +226,200 @@ async def test_spawned_subagent_inherits_llm_usage_source(tmp_path):
 
     spec = sm.runner.run.call_args.args[0]
     assert spec.llm_usage_source == "cron"
+
+
+def _messages_of_call(provider: MagicMock, index: int) -> list[dict[str, Any]]:
+    """Return the ``messages`` kwarg of the Nth `chat_with_retry` call."""
+    return provider.chat_with_retry.await_args_list[index].kwargs["messages"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_inherits_agent_tool_deny(tmp_path):
+    """A subagent must obey the parent scope's tool blacklist.
+
+    Without this, ``spawn`` is a **bypass around the agent tool whitelist**: a
+    parent denied ``write_file`` can simply ask a child to do it, because
+    ``_build_tools`` loads everything and only the parent turn carries the
+    authorization gate.
+    """
+    provider = MagicMock(spec=LLMProvider)
+    provider.get_default_model.return_value = "test"
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content="delegating the write",
+            tool_calls=[
+                ToolCallRequest(
+                    id="call_1",
+                    name="write_file",
+                    arguments={"path": "out.txt", "content": "pwned"},
+                )
+            ],
+        ),
+        LLMResponse(content="could not write", tool_calls=[]),
+    ])
+    sm = SubagentManager(
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=16_000,
+    )
+    scope = build_workspace_scope(
+        tmp_path, "restricted", tool_deny=["write_file"], agent_id="expert-a"
+    )
+
+    await sm.run_inline(
+        task="write a file for me",
+        session_key="test:direct",
+        runtime=_runtime(provider),
+        workspace_scope=scope,
+    )
+
+    # The refusal has to reach the child as a tool result — a denied call that
+    # silently vanished would just make the subagent loop on it.
+    tool_result = _messages_of_call(provider, 1)[-1]["content"]
+    assert "denies the 'write_file' tool" in tool_result
+    assert "expert-a" in tool_result
+    assert not (tmp_path / "out.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_subagent_without_agent_tool_policy_can_still_write(tmp_path):
+    """No declared policy must stay permissive (regression guard).
+
+    The gate that fixes the bypass must not turn into "subagents may never use
+    anything": an absent whitelist means *unrestricted*, not *deny-all*.
+    """
+    provider = MagicMock(spec=LLMProvider)
+    provider.get_default_model.return_value = "test"
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content="writing",
+            tool_calls=[
+                ToolCallRequest(
+                    id="call_1",
+                    name="write_file",
+                    arguments={"path": "out.txt", "content": "hello"},
+                )
+            ],
+        ),
+        LLMResponse(content="wrote it", tool_calls=[]),
+    ])
+    sm = SubagentManager(
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=16_000,
+    )
+
+    await sm.run_inline(
+        task="write a file for me",
+        session_key="test:direct",
+        runtime=_runtime(provider),
+        workspace_scope=build_workspace_scope(tmp_path, "restricted"),
+    )
+
+    assert (tmp_path / "out.txt").read_text(encoding="utf-8") == "hello"
+
+
+@pytest.mark.asyncio
+async def test_subagent_inherits_agent_tool_allow(tmp_path):
+    """A declared whitelist is minimal-privilege: anything unlisted is denied."""
+    provider = MagicMock(spec=LLMProvider)
+    provider.get_default_model.return_value = "test"
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content="writing",
+            tool_calls=[
+                ToolCallRequest(
+                    id="call_1",
+                    name="write_file",
+                    arguments={"path": "out.txt", "content": "nope"},
+                )
+            ],
+        ),
+        LLMResponse(content="denied", tool_calls=[]),
+    ])
+    sm = SubagentManager(
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=16_000,
+    )
+    scope = build_workspace_scope(tmp_path, "restricted", tool_allow=["read_file"])
+
+    await sm.run_inline(
+        task="write a file for me",
+        session_key="test:direct",
+        runtime=_runtime(provider),
+        workspace_scope=scope,
+    )
+
+    tool_result = _messages_of_call(provider, 1)[-1]["content"]
+    assert "does not include 'write_file'" in tool_result
+    assert not (tmp_path / "out.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_persona_is_appended_not_replacing_the_template(tmp_path):
+    """`persona` adds who the subagent is; it must not replace the template.
+
+    The rendered template carries the **workspace boundary and skills summary**
+    — a safety boundary, not a style choice. Letting a caller overwrite it would
+    make "dispatch to this expert" silently drop the subagent's sandbox.
+    """
+    provider = MagicMock(spec=LLMProvider)
+    provider.get_default_model.return_value = "test"
+    sm = SubagentManager(
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=16_000,
+    )
+    plain = sm._build_subagent_prompt(workspace=tmp_path)
+    with_persona = sm._build_subagent_prompt(
+        workspace=tmp_path, persona="你是法务专家，只回答合规问题。"
+    )
+
+    assert with_persona.startswith(plain)
+    assert "你是法务专家" in with_persona
+    # 模板里的安全段还在 —— 被覆盖的话这两句会消失
+    assert "You are a subagent" in with_persona
+    assert "untrusted external data" in with_persona
+
+
+@pytest.mark.asyncio
+async def test_blank_persona_leaves_prompt_untouched(tmp_path):
+    """A blank persona must not add stray separators to the prompt."""
+    provider = MagicMock(spec=LLMProvider)
+    provider.get_default_model.return_value = "test"
+    sm = SubagentManager(
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=16_000,
+    )
+    plain = sm._build_subagent_prompt(workspace=tmp_path)
+    assert sm._build_subagent_prompt(workspace=tmp_path, persona=None) == plain
+    assert sm._build_subagent_prompt(workspace=tmp_path, persona="   \n ") == plain
+
+
+@pytest.mark.asyncio
+async def test_run_inline_forwards_persona_into_messages(tmp_path):
+    """The dispatched persona has to reach the child's system message."""
+    provider = MagicMock(spec=LLMProvider)
+    provider.get_default_model.return_value = "test"
+    sm = SubagentManager(
+        workspace=tmp_path,
+        bus=MessageBus(),
+        max_tool_result_chars=16_000,
+    )
+    sm.runner.run = AsyncMock(
+        return_value=AgentRunResult(final_content="ok", messages=[], stop_reason="completed")
+    )
+    sm._announce_result = AsyncMock()
+
+    await sm.run_inline(
+        task="review this contract",
+        session_key="test:direct",
+        runtime=_runtime(provider),
+        persona="你是法务专家。",
+    )
+
+    spec = sm.runner.run.call_args.args[0]
+    assert spec.initial_messages[0]["role"] == "system"
+    assert "你是法务专家。" in spec.initial_messages[0]["content"]

@@ -14,11 +14,16 @@ if TYPE_CHECKING:
     from dulwich.objects import Blob, Commit, ObjectID, Tree
     from dulwich.refs import Ref
     from dulwich.repo import Repo
+    from filelock import FileLock
 
 # Cap on the unified-diff block embedded in Dream commit messages. Memory files
 # are tiny in practice, but a pathological rewrite must not blow up the audit
 # record. The structured per-file summary is always emitted in full regardless.
 _WORKING_TREE_DIFF_MAX_CHARS = 6000
+
+# Repo creation is serialised across processes (see GitStore.init). The winner's
+# work takes milliseconds, so this only bounds a pathological stall.
+_INIT_LOCK_TIMEOUT_SECONDS = 30
 
 
 class GitStoreError(RuntimeError):
@@ -57,11 +62,26 @@ class GitStore:
 
     # -- init ------------------------------------------------------------------
 
+    def _init_lock(self) -> "FileLock":
+        """Cross-process lock serialising repo creation for this workspace.
+
+        ``nanobot gateway`` and the managed ``nanobot serve`` process both
+        bootstrap the same workspace at startup, so first-run creation has to be
+        serialised — see :meth:`init`.
+        """
+        from filelock import FileLock
+
+        return FileLock(
+            str(self._workspace / ".gitstore.lock"),
+            timeout=_INIT_LOCK_TIMEOUT_SECONDS,
+        )
+
     def init(self) -> bool:
         """Initialize a git repo if not already initialized.
 
         Creates .gitignore and makes an initial commit.
-        Returns True if a new repo was created, False if already exists.
+        Returns True if a new repo was created, False if one already exists —
+        including when a concurrent nanobot process created it first.
         """
         if self.is_initialized():
             return False
@@ -74,51 +94,79 @@ class GitStore:
             )
             return False
 
+        # The init lock lives inside the workspace, so it must exist first.
+        self._workspace.mkdir(parents=True, exist_ok=True)
+
         try:
-            from dulwich import porcelain
-
-            porcelain.init(str(self._workspace))
-
-            # Write .gitignore (merge with existing if present)
-            gitignore = self._workspace / ".gitignore"
-            dream_entries = self._build_gitignore()
-            if gitignore.exists():
-                existing = gitignore.read_text(encoding="utf-8")
-                existing_lines = set(existing.splitlines())
-                new_lines = [
-                    line
-                    for line in dream_entries.splitlines()
-                    if line not in existing_lines
-                ]
-                if new_lines:
-                    merged = existing.rstrip("\n") + "\n" + "\n".join(new_lines) + "\n"
-                    gitignore.write_text(merged, encoding="utf-8")
-            else:
-                gitignore.write_text(dream_entries, encoding="utf-8")
-
-            # Ensure tracked files exist (touch them if missing) so the initial
-            # commit has something to track.
-            for rel in self._tracked_files:
-                p = self._workspace / rel
-                p.parent.mkdir(parents=True, exist_ok=True)
-                if not p.exists():
-                    p.write_text("", encoding="utf-8")
-
-            # Initial commit
-            porcelain.add(
-                str(self._workspace),
-                paths=self._staging_paths(".gitignore", *self._tracked_files),
-            )
-            porcelain.commit(
-                str(self._workspace),
-                message=b"init: nanobot memory store",
-                author=b"nanobot <nanobot@dream>",
-                committer=b"nanobot <nanobot@dream>",
-            )
-            logger.info("Git store initialized at {}", self._workspace)
-            return True
+            with self._init_lock():
+                return self._create_repo()
         except Exception as exc:
             raise GitStoreError(f"Git store init failed for {self._workspace}") from exc
+
+    def _create_repo(self) -> bool:
+        """Create the repo, then write .gitignore and the initial commit.
+
+        The caller must hold the init lock. Returns False when the repo already
+        exists, i.e. another process created it while we waited for the lock.
+        """
+        # [LOCAL PATCH] sciherd-cloud-smartagent：dulwich 的 Repo.init() 是无条件
+        # os.mkdir(".git")，两个进程同时做首次 bootstrap 时后到者必抛
+        # FileExistsError（gateway 与 serve 同时启动即触发）。锁内二次检查，并吞掉
+        # FileExistsError，让输的一方安静退出，而不是抛出误导性的 ERROR 堆栈。
+        if self.is_initialized():
+            logger.debug("Git store created concurrently at {}", self._workspace)
+            return False
+
+        from dulwich import porcelain
+
+        try:
+            porcelain.init(str(self._workspace))
+        except FileExistsError:
+            # Someone that does not take the lock (a manual `git init`, another
+            # nanobot build) won the race. An existing repo counts as success.
+            if self.is_initialized():
+                logger.debug("Git store created concurrently at {}", self._workspace)
+                return False
+            raise
+
+        # Write .gitignore (merge with existing if present)
+        gitignore = self._workspace / ".gitignore"
+        dream_entries = self._build_gitignore()
+        if gitignore.exists():
+            existing = gitignore.read_text(encoding="utf-8")
+            existing_lines = set(existing.splitlines())
+            new_lines = [
+                line
+                for line in dream_entries.splitlines()
+                if line not in existing_lines
+            ]
+            if new_lines:
+                merged = existing.rstrip("\n") + "\n" + "\n".join(new_lines) + "\n"
+                gitignore.write_text(merged, encoding="utf-8")
+        else:
+            gitignore.write_text(dream_entries, encoding="utf-8")
+
+        # Ensure tracked files exist (touch them if missing) so the initial
+        # commit has something to track.
+        for rel in self._tracked_files:
+            p = self._workspace / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if not p.exists():
+                p.write_text("", encoding="utf-8")
+
+        # Initial commit
+        porcelain.add(
+            str(self._workspace),
+            paths=self._staging_paths(".gitignore", *self._tracked_files),
+        )
+        porcelain.commit(
+            str(self._workspace),
+            message=b"init: nanobot memory store",
+            author=b"nanobot <nanobot@dream>",
+            committer=b"nanobot <nanobot@dream>",
+        )
+        logger.info("Git store initialized at {}", self._workspace)
+        return True
 
     # -- daily operations ------------------------------------------------------
 

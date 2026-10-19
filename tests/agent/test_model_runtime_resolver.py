@@ -373,3 +373,16 @@ def test_resolver_preserves_canonical_preset_name_for_case_insensitive_input() -
 
     assert selected.model == "deep-model"
     assert selected.model_preset == "Deep Research"
+
+
+def test_with_model_swaps_only_the_model() -> None:
+    """[LOCAL PATCH] FR-2.4：成员模型绑定只换 model，其余生成参数继承。"""
+    base = _runtime()
+    derived = base.with_model("member-model")
+
+    assert derived.model == "member-model"
+    assert derived.provider is base.provider
+    assert derived.context_window_tokens == base.context_window_tokens
+    assert derived.generation == base.generation
+    # 原 runtime 不被就地改写（派发多个成员时是并发复用同一个 base）
+    assert base.model != "member-model"

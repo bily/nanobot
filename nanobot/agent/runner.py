@@ -1051,9 +1051,12 @@ class AgentRunner:
                     "error": response.content
                     or "Model request failed before the provider-hosted tool completed.",
                 })
-        dropped, all_dropped, original_finish_reason = (
-            self._drop_malformed_tool_calls(response)
-        )
+        (
+            dropped,
+            all_dropped,
+            original_finish_reason,
+            longest_bad_arguments_len,
+        ) = self._drop_malformed_tool_calls(response)
         if (
             all_dropped
             and original_finish_reason in ("tool_calls", "function_call")
@@ -1064,7 +1067,7 @@ class AgentRunner:
                 dropped,
             )
             retry_messages = self._malformed_tool_call_retry_messages(
-                messages, response.content,
+                messages, response.content, longest_bad_arguments_len,
             )
             retry_response, retry_usage = await self._request_model(
                 spec, retry_messages, hook, context,
@@ -1082,7 +1085,7 @@ class AgentRunner:
                 "Malformed tool calls persisted after retry; falling back to no-tools request",
             )
             fallback_messages = self._malformed_tool_call_retry_messages(
-                messages, response.content,
+                messages, response.content, longest_bad_arguments_len,
             )
             fallback_response = await self._request_no_tools(
                 spec,
@@ -1100,31 +1103,53 @@ class AgentRunner:
     @staticmethod
     def _drop_malformed_tool_calls(
         response: LLMResponse,
-    ) -> tuple[int, bool, str | None]:
-        """Strip tool calls whose name is missing/non-string from the response.
+    ) -> tuple[int, bool, str | None, int]:
+        """Strip unusable tool calls (bad name **or** unparseable arguments) in place.
 
-        Returns (dropped_count, all_dropped, original_finish_reason).
+        Returns ``(dropped_count, all_dropped, original_finish_reason,
+        longest_bad_arguments_len)``.
 
-        A degenerate call (name=None or "") cannot be executed, and if it were
-        persisted into the assistant message it would be replayed on every
-        subsequent turn, causing upstream validation errors
-        (``tool_use.name: Input should be a valid string``) that permanently
-        wedge the session. Dropping it here keeps it out of execution, the
-        assistant message, and the saved history in one place.
+        Two degenerate shapes cannot be executed and must never be persisted:
+
+        - **name** missing / non-string: replayed on every subsequent turn it makes
+          upstream validation reject the whole request
+          (``tool_use.name: Input should be a valid string``), which permanently
+          wedges the session.
+        - **arguments** that never parsed into a JSON object (see
+          ``ToolCallRequest.has_usable_arguments``): in practice a payload cut off
+          by the output token limit, since a truncated JSON object never parses.
+          Replaying it is worse than dropping it —
+          ``tool_arguments_object_for_replay`` repairs the fragment with
+          ``json_repair`` and silently poisons the history with fabricated
+          parameters.
+
+        `longest_bad_arguments_len` is the length of the longest unusable
+        arguments payload (0 when the drop was name-only); it feeds the retry note
+        so the model learns how oversized its single call was.
         """
         calls = getattr(response, "tool_calls", None)
         if not calls:
-            return (0, False, getattr(response, "finish_reason", None))
-        valid = [tc for tc in calls if tc.has_valid_name()]
+            return (0, False, getattr(response, "finish_reason", None), 0)
+        valid = [tc for tc in calls if tc.has_valid_name() and tc.has_usable_arguments()]
         if len(valid) == len(calls):
-            return (0, False, getattr(response, "finish_reason", None))
+            return (0, False, getattr(response, "finish_reason", None), 0)
         dropped = len(calls) - len(valid)
         original_finish_reason = getattr(response, "finish_reason", None)
+        longest_bad_arguments_len = max(
+            (
+                len(tc.arguments)
+                for tc in calls
+                if not tc.has_usable_arguments() and isinstance(tc.arguments, str)
+            ),
+            default=0,
+        )
         logger.warning(
-            "Dropped {} malformed tool call(s) with missing/non-string name "
-            "from LLM response (finish_reason={!r})",
+            "Dropped {} malformed tool call(s) with missing/non-string name or "
+            "unparseable arguments from LLM response (finish_reason={!r}, "
+            "longest unusable arguments={} chars)",
             dropped,
             original_finish_reason,
+            longest_bad_arguments_len,
         )
         response.tool_calls = valid
         # The opaque candidate still contains every raw function_call item.
@@ -1133,21 +1158,33 @@ class AgentRunner:
         response.provider_state = None
         if not valid:
             response.finish_reason = "stop"
-        return (dropped, not valid, original_finish_reason)
+        return (dropped, not valid, original_finish_reason, longest_bad_arguments_len)
 
     @staticmethod
     def _malformed_tool_call_retry_messages(
         messages: list[dict[str, Any]],
         assistant_text: str | None,
+        bad_arguments_len: int = 0,
     ) -> list[dict[str, Any]]:
         retry_messages = list(messages)
         note = (
             "The previous model response attempted to call tools, but every tool call "
-            "was malformed: the tool_use blocks had missing or non-string tool names. "
+            "was malformed and had to be discarded: either the tool_use block had a "
+            "missing/non-string tool name, or its arguments were not a valid JSON object "
+            "(a truncated payload never parses). "
             "Do not answer with a promise to use tools. Either call the required tools again "
             "using valid tool names from the provided tool list and JSON object inputs, or give "
             "a final answer only if no tool is required."
         )
+        if bad_arguments_len:
+            note += (
+                f"\n\nThe discarded arguments payload was about {bad_arguments_len} characters "
+                "long, which suggests it was cut off before the JSON object was closed — most "
+                "likely by the output token limit. When the content is large, do not send it in "
+                "one call: call write_file(path, content=\"<first part>\") first, then extend the "
+                "same file with write_file(path, content=\"<next part>\", append=true) until it "
+                "is complete."
+            )
         if assistant_text:
             note += (
                 f"\n\nPrevious assistant text before the malformed calls:\n"

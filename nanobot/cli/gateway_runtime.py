@@ -514,7 +514,7 @@ def _run_gateway(
         recovery=recovery,
     )
     webui_turn_coordinator.subscribe(runtime_events)
-    from nanobot.bus.events import OutboundMessage
+    from nanobot.bus.events import InboundMessage, OutboundMessage
     from nanobot.session.keys import session_key_for_channel
 
     def _channel_session_key(channel: str, chat_id: str) -> str:
@@ -573,6 +573,9 @@ def _run_gateway(
             dream_session_key = MemoryStore.dream_session_key
             prune_dream_sessions = MemoryStore.prune_dream_sessions
 
+            # [LOCAL PATCH] FR-4.6：审查闸门默认开；开时产物写候选区、不直接改正式文件。
+            require_review = config.agents.defaults.dream.require_review
+
             store = agent.context.memory
             resp = None
             diff_body = ""
@@ -589,39 +592,59 @@ def _run_gateway(
                     prompt,
                     session_key=key,
                     ephemeral=True,
-                    tools=store.build_dream_tools(),
+                    tools=store.build_dream_tools(require_review=require_review),
                     on_progress=_silent,
                     runtime=dream_runtime,
                 )
-                # The real file delta grounds the audit record; normal completion
-                # decides whether this history batch has finished processing.
-                diff_body = store.dream_content_diff()
                 completed = MemoryStore.dream_run_completed(resp)
                 if completed:
                     store.set_last_dream_cursor(last_cursor)
-                    if diff_body:
-                        logger.info(
-                            "Dream cron job completed, cursor advanced to {}",
-                            last_cursor,
-                        )
+                    if require_review:
+                        # 产物在候选区，等用户审查；不在此提交正式文件。
+                        if store.has_dream_candidate():
+                            logger.info(
+                                "Dream cron job completed, cursor advanced to {}; "
+                                "candidate pending review",
+                                last_cursor,
+                            )
+                        else:
+                            logger.info(
+                                "Dream cron job completed with no memory changes; "
+                                "cursor advanced to {}",
+                                last_cursor,
+                            )
                     else:
-                        logger.info(
-                            "Dream cron job completed with no memory changes; "
-                            "cursor advanced to {}",
-                            last_cursor,
-                        )
+                        # 闸门关：旧行为，直接增量提交正式文件。
+                        diff_body = store.dream_content_diff()
+                        if diff_body:
+                            logger.info(
+                                "Dream cron job completed, cursor advanced to {}",
+                                last_cursor,
+                            )
+                        else:
+                            logger.info(
+                                "Dream cron job completed with no memory changes; "
+                                "cursor advanced to {}",
+                                last_cursor,
+                            )
                 else:
                     logger.warning(
                         "Dream cron job did not complete ({}); cursor remains at {}",
                         MemoryStore.dream_incompletion_reason(resp),
                         store.get_last_dream_cursor(),
                     )
+                    # 未完成：若开了闸门，丢弃半成品候选。
+                    if require_review:
+                        store.reject_dream_candidate()
             except Exception:
                 logger.exception("Dream cron job failed")
+                if require_review:
+                    store.reject_dream_candidate()
             finally:
-                sha = _commit_dream_changes(store)
-                if sha:
-                    logger.info("Dream commit: {}", sha)
+                if not require_review:
+                    sha = _commit_dream_changes(store)
+                    if sha:
+                        logger.info("Dream commit: {}", sha)
                 store.compact_history()
                 prune_dream_sessions(agent.sessions)
             return None
@@ -694,7 +717,16 @@ def _run_gateway(
             return response
 
         if is_bound_cron_job(job):
-            return await run_bound_cron_job(job, agent=agent, cron=cron)
+            # [LOCAL PATCH] FR-5.6：任务仍在自己那个绑定会话里执行（工作区 / 权限 /
+            # 留痕一律不变），跑完再由 bound_runner 按 `payload.delivery` 把结果**另发**
+            # 到外部渠道。出站直接走 bus → ChannelManager._dispatch_outbound，
+            # 那层的指数退避重试是白拿的。
+            return await run_bound_cron_job(
+                job,
+                agent=agent,
+                cron=cron,
+                publish_outbound=bus.publish_outbound,
+            )
 
         reason = "unbound agent cron job must be recreated from a chat session"
         logger.warning(
@@ -774,6 +806,11 @@ def _run_gateway(
         - POST /v1/send         → outbound delivery: push a message from the agent
           side to a bound IM chat (e.g. Feishu) and mirror it into that
           channel's session history. Body: {"channel","chat_id","content"}.
+        - POST /v1/turn         → run **one agent turn** inside an existing IM
+          channel session: the text enters as a normal inbound channel message,
+          so history stays continuous and the reply is delivered back to the IM
+          chat. Body: {"channel","chat_id","content"}. 404 if the channel
+          session does not already exist on disk.
         - POST /v1/cron/reload  → reload the cron job store from disk and
           re-arm the scheduler, so jobs merged into ``jobs.json`` by the
           desktop app take effect immediately (no gateway restart needed).
@@ -861,6 +898,68 @@ def _run_gateway(
             )
             return "200 OK", {"ok": True}
 
+        async def _handle_turn(body: bytes) -> tuple[str, dict[str, object]]:
+            """Run one agent turn inside an existing IM channel session.
+
+            这是 ``/v1/send`` 的「让智能体回话」版本，区别只有一处、但很关键：
+            ``/v1/send`` 只是把**已经写好的文本**投递出去（智能体不参与），
+            而本端点把文本当作一条 **inbound** 消息投进 bus，由 ``AgentLoop.run()``
+            按正常渠道消息处理——于是它复用了渠道的全部既有语义：
+
+            - 会话 key 由 ``f"{channel}:{chat_id}"`` 解析（``InboundMessage.session_key``），
+              **与该 IM 线程此前每一轮完全同一个会话**，历史连续；
+            - 用户消息与助手回复都由 loop 自己落盘（``session.add_message`` + ``save``），
+              所以桌面端 4 秒轮询能像读渠道历史一样读到这一轮；
+            - 回复经 ``bus.publish_outbound`` → ``ChannelManager._dispatch_outbound``
+              真实投递回 IM，并自带那层的指数退避重试。
+
+            ⚠️ 为什么不复用 ``serve`` 的 ``/v1/chat``：那条路径会执行
+            ``session_key = f"api:{session_id}"``（见 ``api/server.py``），
+            凭空造出一个 ``api:`` 前缀的**新会话**——与 IM 线程脱节，且不落 IM 历史。
+            渠道轮次只能从渠道这一侧进入，这正是本端点存在的理由。
+
+            安全：``require_existing_session=True`` 保证不会因一个拼错的 chat_id
+            就凭空建出一个空会话并让模型对着空气回答（loop 见
+            ``msg.require_existing_session and get_cached(...) is None`` → 丢弃）。
+            """
+            try:
+                data = _json.loads(body.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return "400 Bad Request", {"ok": False, "error": "invalid json body"}
+            channel = str(data.get("channel") or "").strip()
+            chat_id = str(data.get("chat_id") or "").strip()
+            content = str(data.get("content") or "").strip()
+            if not channel or not chat_id or not content:
+                return "400 Bad Request", {
+                    "ok": False,
+                    "error": "channel, chat_id and content are required",
+                }
+            if channels.get_channel(channel) is None:
+                return "409 Conflict", {
+                    "ok": False,
+                    "error": f"channel is not enabled: {channel}",
+                }
+            # 会话必须**已经存在**（在引擎磁盘上），否则拒绝：
+            # get_or_create 会把任何拼错的 chat_id 变成一个凭空的新会话。
+            key = _channel_session_key(channel, chat_id)
+            known = {str(entry.get("key") or "") for entry in session_manager.list_sessions()}
+            if key not in known:
+                return "404 Not Found", {
+                    "ok": False,
+                    "error": f"channel session not found: {key}",
+                }
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel=channel,
+                    # 桌面前端不是 IM 用户；用固定标识以便日志区分来源。
+                    sender_id="desktop",
+                    chat_id=chat_id,
+                    content=content,
+                    require_existing_session=True,
+                )
+            )
+            return "200 OK", {"ok": True, "session_key": key}
+
         async def _handle_cron_reload() -> tuple[str, dict[str, object]]:
             """Reload cron jobs from disk so external edits take effect now."""
             try:
@@ -894,6 +993,9 @@ def _run_gateway(
                         )
                     elif method == "POST" and path == "/v1/send":
                         status, payload = await _handle_send(body)
+                        await _write_response(writer, status, payload)
+                    elif method == "POST" and path == "/v1/turn":
+                        status, payload = await _handle_turn(body)
                         await _write_response(writer, status, payload)
                     elif method == "POST" and path == "/v1/cron/reload":
                         status, payload = await _handle_cron_reload()

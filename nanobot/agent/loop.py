@@ -27,9 +27,21 @@ from nanobot.agent.autocompact import AutoCompact
 from nanobot.agent.automation_turns import publish_next_deferred_turn
 from nanobot.agent.context import ContextBuilder, PersistedPromptContextResolver, TranscriptInput
 from nanobot.agent.cron_turns import CronTurnCoordinator
+from nanobot.agent.expert_group import (
+    EXPERT_GROUP_METADATA_KEY,
+    ExpertGroupError,
+    ExpertGroupOrchestrator,
+    ExpertMember,
+    RunMember,
+    parse_expert_group,
+)
 from nanobot.agent.hook import AgentHook, AgentTurnHookFactory
 from nanobot.agent.memory import Consolidator
 from nanobot.agent.model_runtime import ModelRuntimeResolver
+from nanobot.agent.subagent_progress import (
+    bind_subagent_progress,
+    reset_subagent_progress,
+)
 from nanobot.agent.runner import (
     _MAX_INJECTIONS_PER_TURN,
     AgentRunner,
@@ -68,9 +80,13 @@ from nanobot.runtime_context import (
     resolve_runtime_context,
     runtime_context_blocks_from_metadata,
 )
+from nanobot.security.im_approval import ApprovalInbox
+from nanobot.security.tool_approval import PENDING_APPROVALS
 from nanobot.security.workspace_access import (
+    WorkspaceScope,
     WorkspaceScopeResolver,
     bind_workspace_scope,
+    channel_tool_approval_modes,
     reset_workspace_scope,
 )
 from nanobot.session import turn_continuation
@@ -298,6 +314,7 @@ class AgentLoop:
         preset_catalog_loader: preset_helpers.PresetCatalogLoader | None = None,
         model_preset: str | None = None,
         dream_model_preset: str | None = None,
+        dream_require_review: bool | None = None,
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
         runtime_events: RuntimeEventBus | None = None,
         turn_delivery_factory: TurnDeliveryFactory | None = None,
@@ -355,6 +372,9 @@ class AgentLoop:
             preset_snapshot_loader=preset_snapshot_loader,
         )
         self.dream_model_preset = dream_model_preset
+        # [LOCAL PATCH] FR-4.6：Dream 审查闸门默认开（与 DreamConfig.require_review
+        # 同义；from_config 会从配置注入，构造时未给则取安全的默认 True）。
+        self.dream_require_review = dream_require_review if dream_require_review is not None else True
         self.context_block_limit = context_block_limit
         self.max_tool_result_chars = (
             max_tool_result_chars
@@ -381,10 +401,23 @@ class AgentLoop:
         self.workspace_scopes = WorkspaceScopeResolver(
             default_workspace=workspace,
             default_restrict_to_workspace=restrict_to_workspace,
+            # [LOCAL PATCH] FR-6.5：IM 渠道没有「逐条批准」的请求级开关，
+            # 只能从 `channels.<name>.tool_approval` 读；默认空 = 全部 auto。
+            default_tool_approval_by_channel=channel_tool_approval_modes(
+                channels_config
+            ),
         )
         self._start_time = time.time()
         self._extra_hooks: list[AgentHook] = hooks or []
         self._hook_factories: list[AgentTurnHookFactory] = hook_factories or []
+
+        # [LOCAL PATCH] FR-6.5：IM 内的审批裁决入口。
+        # 与 ``ToolApprovalHook`` 共用同一个进程级注册表（``PENDING_APPROVALS``），
+        # 否则「出」和「入」各自握一份，裁决永远投不到挂起的那个 future 上。
+        self._approval_inbox = ApprovalInbox(
+            PENDING_APPROVALS,
+            publish=self.bus.publish_outbound,
+        )
 
         # [LOCAL PATCH] FR-3.4：用户级插件目录要存到实例上。
         # `_register_default_tools` 是另一个方法，够不到 `__init__` 的局部变量；
@@ -564,6 +597,7 @@ class AgentLoop:
             model_presets=preset_helpers.configured_model_presets(config),
             model_preset=defaults.model_preset,
             dream_model_preset=defaults.dream.model_override,
+            dream_require_review=defaults.dream.require_review,
             restart_mode=config.gateway.restart_mode,
             provider_snapshot_loader=provider_snapshot_loader,
             preset_snapshot_loader=preset_snapshot_loader,
@@ -582,6 +616,44 @@ class AgentLoop:
     def refresh_runtime_config(self) -> LLMRuntime:
         """Refresh runtime config now and publish the canonical selection."""
         self.runtime_resolver.invalidate()
+        runtime = self.runtime_resolver.admit()
+        self._publish_runtime_selection(runtime)
+        return runtime
+
+    # [LOCAL PATCH] nanowork：配置热更新（模型增删改 / 换默认模型「保存即生效」）。
+    #
+    # 为什么必须换掉整个 resolver 而不是 `invalidate()`：preset 目录与快照 loader 都是
+    # **启动时那个 Config 对象的闭包**（`make_preset_snapshot_loader(config, ...)`、
+    # `configured_model_presets(config)`），invalidate 只会拿同一份旧配置重新推导——
+    # 新加的模型永远不出现。这也是客户端以前只能提示「重启网关」的原因。
+    #
+    # 重建 resolver 等价于「重启进程里的模型装配部分」，但不碰会话、不碰工作区、
+    # 不重连渠道，代价远低于一次进程重启。
+    def reload_runtime_config(self, config: "Config") -> LLMRuntime:
+        """从**新读入的**配置重建模型装配（provider / 预设目录 / 默认模型）。
+
+        调用方负责传入刚 `load_config()` 出来的对象；解析失败应当由调用方先行拦下，
+        这里不做兜底——半套配置比旧配置更糟。
+        """
+        from nanobot.providers.factory import make_provider
+
+        provider = make_provider(config)
+        resolved = config.resolve_preset()
+        defaults = config.agents.defaults
+        self.runtime_resolver = ModelRuntimeResolver(
+            LLMRuntime.capture(
+                provider,
+                resolved.model,
+                context_window_tokens=resolved.context_window_tokens,
+            ),
+            model_presets=preset_helpers.configured_model_presets(config),
+            # 目录与快照 loader 都闭包住**新**config：之后再 invalidate 也不会退回旧值
+            preset_catalog_loader=lambda: preset_helpers.configured_model_presets(config),
+            configured_default_preset=defaults.model_preset,
+            preset_snapshot_loader=preset_helpers.make_preset_snapshot_loader(config, None),
+        )
+        self.dream_model_preset = defaults.dream.model_override
+        self.dream_require_review = defaults.dream.require_review
         runtime = self.runtime_resolver.admit()
         self._publish_runtime_selection(runtime)
         return runtime
@@ -1168,6 +1240,10 @@ class AgentLoop:
         file_state_token = bind_file_states(self._file_state_store.for_session(active_session_key))
         request_token = bind_request_context(request_ctx)
         workspace_token = bind_workspace_scope(effective_scope)
+        # [LOCAL PATCH] FR-2.5 第 4 步：把本轮的进度出口绑给子代理。
+        # 与 workspace scope 同一处绑定、同一处还原 —— 两者都是「本轮」作用域，
+        # 分开放会让读者以为它们生命周期不同（然后其中一个忘了还原）。
+        subagent_progress_token = bind_subagent_progress(on_progress)
         turn_scope_stack = ExitStack()
         # Compute lazily because create_goal may create goal metadata during this run.
         def _goal_continue() -> str | None:
@@ -1201,6 +1277,9 @@ class AgentLoop:
                 turn_hook_factories=list(hook_factories or []),
                 registered_hooks=self._extra_hooks,
                 turn_hooks=list(hooks or []),
+                # [LOCAL PATCH] FR-3.12：技能 / 插件声明的工具白名单（装配期算一次，
+                # 不让热路径上的每次工具调用去扫盘）。
+                declared_tools=self.context.declared_tool_policy(effective_scope.project_path),
                 ephemeral=ephemeral,
                 run_extra_hooks_for_ephemeral=run_extra_hooks_for_ephemeral,
             ))
@@ -1265,6 +1344,7 @@ class AgentLoop:
             ))
         finally:
             turn_scope_stack.close()
+            reset_subagent_progress(subagent_progress_token)
             reset_workspace_scope(workspace_token)
             reset_request_context(request_token)
             reset_file_states(file_state_token)
@@ -1332,6 +1412,14 @@ class AgentLoop:
                 raw = msg.content.strip()
                 effective_key = self._effective_session_key(msg)
                 if await agent_context.handle_runtime_control(self, msg, self.tools):
+                    continue
+                # [LOCAL PATCH] FR-6.5：IM 内的审批裁决必须先于一切路由被吸收。
+                # 放在这里而不是命令分发之后：一条裸裁决（「允许」）既不是命令，
+                # 也不该进 pending 队列——那会让它变成「新一轮用户输入」，模型
+                # 会对着「拒绝」两个字开始自由发挥，而真正挂起的工具继续等到超时。
+                if msg.is_user_input and await self._approval_inbox.consume(
+                    msg, session_key=effective_key
+                ):
                     continue
                 if (
                     msg.require_existing_session
@@ -2044,6 +2132,10 @@ class AgentLoop:
             ctx.visible_run_started_at = time.time()
         await ctx.delivery.running(started_at=ctx.visible_run_started_at)
         assert ctx.transcript_input is not None
+        # [LOCAL PATCH] FR-2.4 专家团编排：命中 expert_group 时由引擎调度成员，
+        # 正常 agent loop 完全不跑；最终汇总作为本轮唯一一条 assistant 消息落库。
+        if await self._maybe_run_expert_group(ctx):
+            return
         with capture_message_deliveries() as message_sends:
             result = await self._run_agent_loop(
                 ctx.transcript_input,
@@ -2078,6 +2170,197 @@ class AgentLoop:
         ctx.delivery.record_usage(result.round_usages)
         if ctx.kind is TurnKind.USER:
             await turn_continuation.maybe_continue_turn(ctx)
+
+    async def _maybe_run_expert_group(self, ctx: TurnContext) -> bool:
+        """[LOCAL PATCH] FR-2.4：本轮若携带 ``expert_group``，由引擎调度专家团。
+
+        返回 ``True`` 表示本轮已由编排接管——调用方**必须**跳过正常 agent loop。
+        设计见 ``docs/design-fr-2-4-expert-orchestration.md`` §3 / §7.2。
+        """
+        raw_spec = (ctx.msg.metadata or {}).get(EXPERT_GROUP_METADATA_KEY)
+        if raw_spec is None:
+            return False
+        try:
+            spec = parse_expert_group(raw_spec)
+        except ExpertGroupError as exc:
+            # 请求侧已在 API 层校验过；走到这里说明形状被绕过。不静默忽略——
+            # 把拒绝原因作为本轮唯一输出摆到用户面前，好过悄悄退化成普通一轮对话。
+            logger.warning("invalid expert_group payload: {}", exc)
+            self._finish_expert_group_turn(ctx, f"Expert group request rejected: {exc}")
+            ctx.stop_reason = "error"
+            return True
+        if spec is None:
+            return False
+
+        request_ctx = ctx.request_context
+        channel = request_ctx.channel if request_ctx is not None else ctx.msg.channel
+        chat_id = request_ctx.chat_id if request_ctx is not None else ctx.msg.chat_id
+        message_id = request_ctx.message_id if request_ctx is not None else None
+        request_metadata = (
+            request_ctx.metadata if request_ctx is not None else ctx.msg.metadata
+        )
+        base_scope = self.workspace_scopes.for_turn(
+            channel=channel,
+            message_metadata=request_metadata,
+            session_metadata=ctx.session.metadata if ctx.session is not None else None,
+        )
+        base_runtime = ctx.require_runtime()
+
+        _run_member = self._make_member_runner(
+            channel=channel,
+            chat_id=chat_id,
+            message_id=message_id,
+            session_key=ctx.session_key,
+            base_scope=base_scope,
+            base_runtime=base_runtime,
+        )
+
+        async def _on_member_event(
+            kind: str, member: ExpertMember, extra: Mapping[str, Any]
+        ) -> None:
+            # 归属字段随进度事件出站（FR-2.4 第 3 步：客户端按成员分组渲染）。
+            #
+            # ⚠️ `extra` 必须**整体塞进 `member_extra`**，不能平铺成 kwarg：
+            # coordinator 的 ``group_planned`` 载荷里带一个 `plan` 键，而 ``/v1`` 的
+            # ``_on_progress`` 恰好有同名形参（语义是 Plan 模式的结构化计划，期望 dict）。
+            # 平铺会把它绑成那个形参 → 走 `{**plan}` 分支对 str 解包 → TypeError。
+            # 异常会被 orchestrator 的 ``_emit`` 吞掉，现象是「计划事件凭空消失、不报错」。
+            if ctx.on_progress is None:
+                return
+            await ctx.on_progress(
+                "",
+                member={"id": member.id, "name": member.name},
+                member_event=kind,
+                member_extra=dict(extra),
+            )
+
+        orchestrator = ExpertGroupOrchestrator(_run_member, on_event=_on_member_event)
+        try:
+            result = await orchestrator.run(
+                spec, user_request=ctx.original_user_text or ctx.msg.content or ""
+            )
+        except ExpertGroupError as exc:
+            logger.warning("expert group turn failed: {}", exc)
+            self._finish_expert_group_turn(ctx, f"Expert group failed: {exc}")
+            ctx.stop_reason = "error"
+            return True
+        self._finish_expert_group_turn(ctx, result.final_text)
+        return True
+
+    def _make_member_runner(
+        self,
+        *,
+        channel: str,
+        chat_id: str,
+        message_id: str | None,
+        session_key: str,
+        base_scope: WorkspaceScope,
+        base_runtime: LLMRuntime,
+    ) -> RunMember:
+        """把「派发一个成员」封成 ``orchestrator`` 需要的 ``(成员, 输入) -> 产出``。
+
+        [LOCAL PATCH] FR-2.4：抽成工厂而不是留在 ``_maybe_run_expert_group`` 里做闭包，
+        是**为了让它可测**。成员的三项绑定（人设 / 工具策略 / 模型）有没有真的传到
+        子代理，只有这段能证明——做成闭包就永远测不到，而 FR-2.3 时代「专家人设只被
+        解析从未使用」正是这么漏掉的：编排走通了、事件也发了，人设却没进 prompt，
+        而现象只是「成员答得像个通才」，没人会往上追到这里。
+        """
+
+        async def _run_member(member: ExpertMember, prompt: str) -> str:
+            return await self.subagents.run_inline(
+                task=prompt,
+                label=f"expert-group:{member.name}",
+                origin_channel=channel,
+                origin_chat_id=chat_id,
+                # 与父会话同 key：这样「停止本轮」能连带取消在飞的成员（cancel_by_session）。
+                session_key=session_key,
+                origin_message_id=message_id,
+                workspace_scope=self._member_workspace_scope(base_scope, member),
+                persona=member.system_prompt or None,
+                runtime=self._member_runtime(base_runtime, member),
+            )
+
+        return _run_member
+
+    def _finish_expert_group_turn(self, ctx: TurnContext, final_text: str) -> None:
+        """把编排结果表示成「本轮唯一一条 assistant 消息」。
+
+        ``all_messages`` 的前缀只用于让 ``turn_continuation.prepare_save_boundary`` 算出
+        正确的追加边界（``message_count`` = 1 + history + current）；``_save_turn`` 会按该
+        边界跳过它们，因此真正的会话历史里**只多出那一条 assistant 消息**——这正是第 2 步
+        定死的落库形态，避免历史被 N 倍膨胀。
+        """
+        transcript = ctx.transcript_input
+        assert transcript is not None
+        messages: list[dict[str, Any]] = [{"role": "system", "content": ""}]
+        messages.extend(transcript.history)
+        if transcript.current_message is not None:
+            messages.append(
+                {"role": transcript.current_role, "content": transcript.current_message}
+            )
+        messages.append({"role": "assistant", "content": final_text})
+        ctx.all_messages = messages
+        ctx.final_content = final_text
+        ctx.stop_reason = "stop"
+
+    @staticmethod
+    def _member_workspace_scope(base: WorkspaceScope, member: ExpertMember) -> WorkspaceScope:
+        """派生成员作用域：白名单取**交集**、黑名单取**并集**——权限只能单调递减。
+
+        成员没声明任何工具策略时**原样继承**父作用域（而不是清空），否则「没声明」
+        会变成「不受限」，把最小权限反过来放开。
+        """
+        if member.tool_allow is None and not member.tool_deny:
+            return base
+        allow = base.tool_allow
+        if member.tool_allow is not None:
+            member_allow = frozenset(member.tool_allow)
+            allow = member_allow if allow is None else (allow & member_allow)
+        return dataclasses.replace(
+            base,
+            tool_allow=allow,
+            tool_deny=frozenset(base.tool_deny) | frozenset(member.tool_deny),
+            agent_id=member.id,
+        )
+
+    def _member_runtime(self, base: LLMRuntime, member: ExpertMember) -> LLMRuntime:
+        """按成员声明的模型派生 runtime；解析不了就退回本轮 runtime 并留痕。"""
+        model = member.model
+        if not model:
+            return base
+        resolver = getattr(self, "runtime_resolver", None)
+        presets = getattr(self, "model_presets", None) or {}
+        if resolver is not None:
+            try:
+                if model in presets:
+                    return resolver.resolve_preset(model)
+                # [LOCAL PATCH] 配了预设目录却不认识这个名字 → **按失效处理，退回本轮
+                # runtime**。真机证据（2026-10-07）：走 `resolve_override` 会把这个名字
+                # 原样发给 provider，整轮以 `The model 'xxx' does not exist` 告终——
+                # 一个成员的模型名拼错会把**整个专家团**打成失败。
+                #
+                # 与客户端 `resolveTurnModel` 同一规则：**目录为空不等于全部失效**。
+                # 没配预设（presets 为空）时必须允许透传，否则「不配置预设」会变成
+                # 「成员的自定义模型永远不生效」。
+                if presets:
+                    logger.warning(
+                        "expert group member '{}': model '{}' is not a configured "
+                        "preset; using turn runtime",
+                        member.id,
+                        model,
+                    )
+                    return base
+                return resolver.resolve_override(model=model, model_preset=None)
+            except (KeyError, ValueError):
+                logger.warning(
+                    "expert group member '{}': unresolvable model '{}'; using turn runtime",
+                    member.id,
+                    model,
+                )
+                return base
+        if model == base.model:
+            return base
+        return base.with_model(model)
 
     async def _persist_turn(self, ctx: TurnContext) -> None:
         session = ctx.require_session()
@@ -2148,7 +2431,11 @@ class AgentLoop:
             log_content=ctx.require_session().policy.log_content,
             turn_latency_ms=ctx.turn_latency_ms,
         )
-        if ctx.ephemeral and ctx.outbound is not None:
+        # 无条件透出本轮结束原因（原先只给 ephemeral 轮次写）。直连 API
+        # （`/v1/chat/completions`）要把它映射成 SSE 的 finish_reason；拿不到时只能一律报
+        # "stop"，于是「引擎侧中断 / 报错」与「正常收尾」在客户端完全同形——2026-09-29 的
+        # 断流事故正是这样被渲染成「已完成」的（见 api/server.py::_finish_reason_for）。
+        if ctx.outbound is not None:
             ctx.outbound.metadata["_stop_reason"] = ctx.stop_reason
 
     def _sanitize_persisted_blocks(

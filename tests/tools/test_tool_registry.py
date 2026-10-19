@@ -232,8 +232,33 @@ def test_prepare_call_other_tools_keep_generic_object_validation() -> None:
     assert error == (
         "Error: Tool 'grep' parameters must be a JSON object, got list. "
         'Use named parameters like tool_name(param1="value1", param2="value2") '
-        "matching the tool schema."
+        "matching the tool schema. "
+        "If you were writing a large file, the arguments were most likely cut off "
+        "by the output token limit: write it in chunks instead — first call "
+        'write_file(path, content="<first part>"), then append the rest with '
+        'write_file(path, content="<next part>", append=true).'
     )
+
+
+def test_prepare_call_reports_truncated_arguments_with_length_and_preview() -> None:
+    """被输出上限截断的参数必须能自证：长度 + 首尾预览 + 分片指引。
+
+    2026-09-29 事故里只有一句「got str」，看不出是类型传错还是 JSON 写到一半被截断，
+    排障只能靠翻会话记录（`write_file` 的 25186 字符参数停在一段 JS 函数体中间）。
+    """
+    registry = ToolRegistry()
+    registry.register(_FakeTool("write_file"))
+
+    # 半截 JSON：开头像对象、结尾断在字符串里面 —— 截断的典型形状
+    truncated = '{"path": "D:\\\\aaa\\\\tetris.html", "content": "<!DOCTYPE html>…function setDas(dir) { das'
+    tool, params, error = registry.prepare_call("write_file", truncated)
+
+    assert tool is not None
+    assert params == truncated
+    assert error is not None
+    assert f"got str(len={len(truncated)}," in error
+    assert "function setDas(dir) { das" in error  # 尾部预览是判断「截断」的关键证据
+    assert "append=true" in error  # 且必须给出可操作的出路
 
 
 async def test_registry_rejects_unknown_builtin_tool_parameters(tmp_path) -> None:

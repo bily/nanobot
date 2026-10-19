@@ -572,8 +572,20 @@ class MemoryStore:
             return ""
         return self._git.summarize_working_tree(list(self._DREAM_CONTENT_PATHS))
 
-    def build_dream_tools(self) -> ToolRegistry:
-        """Build the restricted tool registry used by Dream runs."""
+    def build_dream_tools(self, *, require_review: bool = True) -> ToolRegistry:
+        """Build the restricted tool registry used by Dream runs.
+
+        When ``require_review`` is True (the default), the write tools target
+        candidate copies under ``memory/.dream_candidate/`` instead of the real
+        ``MEMORY.md`` / SOUL.md / USER.md. The real files are only written
+        later, by :meth:`accept_dream_candidate`, after the user reviews the
+        proposal.
+
+        ⚠️ 默认值**必须**保持 True：False 意味着「梦境产物直落正式记忆文件」，
+        而 FR-4.6 的整个闸门就是为了消灭这条路径。把它设成默认值等于让「忘记传参」
+        变成静默绕过审查——所以回到旧行为必须**显式**
+        ``build_dream_tools(require_review=False)``。
+        """
         from nanobot.agent.skills import BUILTIN_SKILLS_DIR
         from nanobot.agent.tools.apply_patch import ApplyPatchTool
         from nanobot.agent.tools.file_state import FileStates
@@ -587,7 +599,16 @@ class MemoryStore:
         skills_dir.mkdir(parents=True, exist_ok=True)
 
         extra_read = [BUILTIN_SKILLS_DIR] if BUILTIN_SKILLS_DIR.exists() else None
-        editable_files = [self.memory_file, self.soul_file, self.user_file]
+        if require_review:
+            # [LOCAL PATCH] FR-4.6：闸门开 → 先写候选副本，不直落正式文件
+            self.prepare_dream_candidate()
+            editable_files = [
+                self.dream_candidate_dir / "MEMORY.md",
+                self.dream_candidate_dir / "SOUL.md",
+                self.dream_candidate_dir / "USER.md",
+            ]
+        else:
+            editable_files = [self.memory_file, self.soul_file, self.user_file]
 
         tools.register(ReadFileTool(
             workspace=workspace,
@@ -614,6 +635,155 @@ class MemoryStore:
             file_states=file_states,
         ))
         return tools
+
+    # ------------------------------------------------------------------
+    # [LOCAL PATCH] FR-4.6 Dream 审查闸门：candidate 生命周期
+    #
+    # 闸门开启时，Dream 的合并产物先写进 `memory/.dream_candidate/` 下的副本，
+    # 而不是直接改 `MEMORY.md`/SOUL.md/USER.md。用户在客户端审查页「采纳」才把
+    # 副本写回正式文件（并有审计提交）。「不采纳 ⇒ 正式文件逐字节不变」是这条
+    # 闸门的**唯一硬判据**——`accept_dream_candidate` 只在副本内容确实变化时才
+    # 触碰正式文件，且 `reject_dream_candidate` 永远不碰正式文件。
+    # ------------------------------------------------------------------
+
+    @property
+    def dream_candidate_dir(self) -> Path:
+        return self.memory_dir / ".dream_candidate"
+
+    def _dream_real_files(self) -> dict[str, Path]:
+        """Map a stable key to each durable memory file's real path."""
+        return {
+            "MEMORY.md": self.memory_file,
+            "SOUL.md": self.soul_file,
+            "USER.md": self.user_file,
+        }
+
+    def _dream_candidate_paths(self) -> dict[str, Path]:
+        """Map the same stable keys to their candidate-copy paths."""
+        d = self.dream_candidate_dir
+        return {
+            "MEMORY.md": d / "MEMORY.md",
+            "SOUL.md": d / "SOUL.md",
+            "USER.md": d / "USER.md",
+        }
+
+    def prepare_dream_candidate(self) -> None:
+        """Seed candidate copies so a gated Dream run edits a copy, not the real file.
+
+        Each candidate starts as an exact copy of the current real file. Files
+        that do not yet exist in the workspace get no candidate (so a Dream that
+        *creates* them later is classified as ``new`` rather than ``modified``).
+        """
+        ensure_dir(self.dream_candidate_dir)
+        reals = self._dream_real_files()
+        cands = self._dream_candidate_paths()
+        for name in reals:
+            real = reals[name]
+            target = cands[name]
+            if real.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(real.read_text(encoding="utf-8"), encoding="utf-8")
+            elif target.exists():
+                # Drop a stale candidate left from a previous run whose real
+                # counterpart never came into existence.
+                target.unlink()
+
+    def has_dream_candidate(self) -> bool:
+        """Return True when a non-empty candidate diff is pending review."""
+        if not self.dream_candidate_dir.exists():
+            return False
+        reals = self._dream_real_files()
+        cands = self._dream_candidate_paths()
+        for name in reals:
+            cand = cands[name]
+            if not cand.exists():
+                continue
+            real = reals[name]
+            real_text = real.read_text(encoding="utf-8") if real.exists() else ""
+            if cand.read_text(encoding="utf-8") != real_text:
+                return True
+        return False
+
+    def compute_dream_candidate_diff(self) -> dict[str, dict[str, Any]]:
+        """Classify the proposed change per durable file.
+
+        Returns a mapping keyed by ``MEMORY.md`` / ``SOUL.md`` / ``USER.md``.
+        Each value carries ``status`` (``new`` / ``modified`` / ``deleted`` /
+        ``unchanged``), the ``old`` and ``new`` text, and the real ``path``.
+        Files with no candidate at all are omitted.
+        """
+        reals = self._dream_real_files()
+        cands = self._dream_candidate_paths()
+        out: dict[str, dict[str, Any]] = {}
+        for name in reals:
+            real = reals[name]
+            cand = cands[name]
+            if not cand.exists():
+                continue
+            real_text = real.read_text(encoding="utf-8") if real.exists() else ""
+            new_text = cand.read_text(encoding="utf-8")
+            if not real.exists() and new_text.strip() == "":
+                status = "unchanged"
+            elif not real.exists():
+                status = "new"
+            elif new_text == real_text:
+                status = "unchanged"
+            elif new_text.strip() == "":
+                status = "deleted"
+            else:
+                status = "modified"
+            # The review UI only surfaces the three change classes
+            # (new / modified / deleted); unchanged files stay out of the diff.
+            if status == "unchanged":
+                continue
+            out[name] = {
+                "status": status,
+                "old": real_text,
+                "new": new_text,
+                "path": str(real),
+            }
+        return out
+
+    def _clear_dream_candidate(self) -> None:
+        import shutil
+
+        d = self.dream_candidate_dir
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+
+    def accept_dream_candidate(self) -> int:
+        """Write accepted candidate content back to the real durable files.
+
+        Returns the number of files actually changed. Real files are only
+        touched when the candidate content differs, so a no-op candidate leaves
+        every real file byte-for-byte unchanged (the gate's hard guarantee).
+        Accepted changes are recorded as an audit commit.
+        """
+        reals = self._dream_real_files()
+        cands = self._dream_candidate_paths()
+        changed = 0
+        for name in reals:
+            cand = cands[name]
+            real = reals[name]
+            if not cand.exists():
+                continue
+            new_text = cand.read_text(encoding="utf-8")
+            real_text = real.read_text(encoding="utf-8") if real.exists() else ""
+            if new_text == real_text:
+                continue
+            real.parent.mkdir(parents=True, exist_ok=True)
+            real.write_text(new_text, encoding="utf-8")
+            changed += 1
+        if changed and self._git.is_initialized():
+            diff_body = self.dream_content_diff()
+            msg = self.build_dream_commit_message("dream: accepted review", diff_body)
+            self._git.auto_commit(msg)
+        self._clear_dream_candidate()
+        return changed
+
+    def reject_dream_candidate(self) -> None:
+        """Discard the pending Dream candidate. Real files are never touched."""
+        self._clear_dream_candidate()
 
     @staticmethod
     def dream_run_completed(

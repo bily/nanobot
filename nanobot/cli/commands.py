@@ -348,6 +348,7 @@ def serve(
 
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
+    from nanobot.config.loader import get_config_path
     from nanobot.cron.service import CronService
     from nanobot.providers.image_generation import image_gen_provider_configs
     from nanobot.session.manager import SessionManager
@@ -412,12 +413,30 @@ def serve(
         agent_loop, model_name=model_name, request_timeout=timeout,
         api_key=api_key,
         prepare_agent=mcp_provider.connect,
+        # [LOCAL PATCH] nanowork：把配置路径交给 API 层，`POST /v1/config/reload`
+        # 才能在客户端改完模型后热加载，而不必让用户重启网关。
+        config_path=str(get_config_path()) if get_config_path() is not None else None,
     )
 
+    # [LOCAL PATCH] nanowork：MCP 是可选依赖，不该有能力拖死 API 服务器。
+    # 原先在 on_startup 里直接 await connect()，一旦某个 server 挂起（成因见
+    # mcp.py 里 MCP_CONNECT_TIMEOUT_PER_SERVER_S 的注释），aiohttp 就走不到
+    # site.start()，端口永不监听 —— 症状是「一个 MCP 地址配错，整个引擎起不来」。
+    # 改为后台任务：先把端口监听起来；「用到时确保 MCP 就绪」仍由
+    # create_app(prepare_agent=mcp_provider.connect) 在每次请求前保证。
+    mcp_startup_tasks: set[asyncio.Task[Any]] = set()
+
     async def on_startup(_app: Any) -> None:
-        await mcp_provider.connect()
+        task = asyncio.create_task(mcp_provider.connect(), name="mcp-connect-on-startup")
+        mcp_startup_tasks.add(task)
+        task.add_done_callback(mcp_startup_tasks.discard)
 
     async def on_cleanup(_app: Any) -> None:
+        pending = list(mcp_startup_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         try:
             await agent_loop.aclose()
         finally:

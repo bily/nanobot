@@ -1379,6 +1379,23 @@ def _load_current_servers() -> dict[str, MCPServerConfig]:
     return _configured_servers(resolve_config_env_vars(load_config()))
 
 
+# [LOCAL PATCH] nanowork：单次 MCP 连接批次的超时上限（按 server 数量放大）。
+#
+# 为什么必须有：MCP SDK 在握手阶段拿到非预期响应时（典型场景是 URL 指向一个会
+# 302 到网页的地址、最终返回 text/html），`_handle_unexpected_content_type`
+# 只记日志、把 ValueError 塞进读取流，随后进入**无限重连且永不返回**的循环；
+# `connect_single_server` 里的 `await ready` 于是永远等不到结果 —— 注意这是
+# **挂起**而不是异常，任何 `except BaseException` 都兜不住它。
+#
+# 后果会外溢到进程级：`serve` 的 on_startup 里 await connect() 卡住 →
+# aiohttp 永远走不到 site.start() → 端口永不监听 → 上层只能报
+# 「30 秒内未进入监听（进程可能已退出）」，而进程其实活得好好的。
+#
+# 这里同时兑现了 connect_mcp_servers 给调用方的契约注释
+# （"Callers can bound readiness/reload with a timeout."）。
+MCP_CONNECT_TIMEOUT_PER_SERVER_S = 30.0
+
+
 class MCPProvider:
     """Own configured MCP connections and their dynamic tool registrations."""
 
@@ -1479,8 +1496,14 @@ class MCPProvider:
             if not missing_servers:
                 return
             self._set_runtime_status(missing_servers, "connecting")
+            # 见 MCP_CONNECT_TIMEOUT_PER_SERVER_S：兜住「挂起而不抛异常」的连接失败，
+            # 否则这里会永久阻塞调用方（serve 的 on_startup）的启动流程。
+            connect_timeout_s = MCP_CONNECT_TIMEOUT_PER_SERVER_S * max(1, len(missing_servers))
             try:
-                connected = await connect_mcp_servers(missing_servers, self._registry)
+                connected = await asyncio.wait_for(
+                    connect_mcp_servers(missing_servers, self._registry),
+                    timeout=connect_timeout_s,
+                )
                 if self._closing:
                     await _close_mcp_connections(connected)
                     return
@@ -1500,6 +1523,17 @@ class MCPProvider:
                     raise
                 logger.warning(
                     "MCP connection cancelled (will retry on the next readiness check)"
+                )
+            except TimeoutError:
+                # 单独成一支：TimeoutError 的 str() 是空的，落到下面的 BaseException
+                # 分支会打出「Failed to connect MCP servers ...: 」这种没有下文的日志，
+                # 排障时看不出到底是超时还是别的失败。这里把耗时和 server 名列清楚。
+                self._set_runtime_status(missing_servers, "failed")
+                logger.warning(
+                    "MCP connection timed out after {}s for: {} "
+                    "(verify each server URL points at a real MCP endpoint)",
+                    connect_timeout_s,
+                    ", ".join(sorted(missing_servers)),
                 )
             except BaseException as exc:
                 self._set_runtime_status(missing_servers, "failed")
@@ -1568,8 +1602,22 @@ class MCPProvider:
             connected: dict[str, MCPConnection] = {}
             if to_connect:
                 self._set_runtime_status(to_connect, "connecting")
+                connect_timeout_s = MCP_CONNECT_TIMEOUT_PER_SERVER_S * max(1, len(to_connect))
                 try:
-                    connected = await connect_mcp_servers(to_connect, self._registry)
+                    connected = await asyncio.wait_for(
+                        connect_mcp_servers(to_connect, self._registry),
+                        timeout=connect_timeout_s,
+                    )
+                except TimeoutError:
+                    # reload 的契约是「返回结果字典」而不是抛异常：超时按这批
+                    # server 全部失败处理，交给下面的 failed 分支给出可读结论。
+                    self._set_runtime_status(to_connect, "failed")
+                    logger.warning(
+                        "MCP connection timed out after {}s for: {}",
+                        connect_timeout_s,
+                        ", ".join(sorted(to_connect)),
+                    )
+                    connected = {}
                 except BaseException:
                     self._set_runtime_status(to_connect, "failed")
                     raise

@@ -613,3 +613,130 @@ class TestIdentityContextBlock:
 
         assert "agent identity" in result
         assert "project identity collision" not in result
+
+
+# ---------------------------------------------------------------------------
+# [LOCAL PATCH] 当前工作目录：必须**无条件**出现在系统提示词里
+# ---------------------------------------------------------------------------
+class TestCurrentProjectSection:
+    """工作目录是运行时事实，不能留给模型去猜。
+
+    上游写法是 `if project_path != self.workspace: 追加 # Current Project`，
+    于是最常见的两种情况——「会话没绑工作空间」和「绑的正好就是引擎默认那个」——
+    提示词里一个绝对路径都没有（identity.md 那条分支只给相对名）。
+    实测模型会拿记忆里的旧印象当答案，把文件写到用户没指定的目录去。
+    """
+
+    def test_states_working_directory_without_explicit_workspace(self, tmp_path: Path):
+        result = _builder(tmp_path).build_system_prompt()
+
+        assert "# Current Project" in result
+        assert f"Working directory: {tmp_path.resolve()}" in result
+
+    def test_states_working_directory_when_equal_to_agent_workspace(self, tmp_path: Path):
+        """显式传入的工作空间与引擎自身工作空间相同时，同样要说。"""
+        result = _builder(tmp_path).build_system_prompt(workspace=tmp_path)
+
+        assert f"Working directory: {tmp_path.resolve()}" in result
+
+    def test_states_working_directory_for_distinct_project(self, tmp_path: Path):
+        agent_home = tmp_path / "agent-home"
+        project = tmp_path / "project"
+        agent_home.mkdir()
+        project.mkdir()
+
+        result = ContextBuilder(agent_home).build_system_prompt(workspace=project)
+
+        assert f"Working directory: {project.resolve()}" in result
+
+    def test_tells_model_not_to_reuse_stale_paths(self, tmp_path: Path):
+        """记忆/技能里的路径是滞后的，末句要明确把它降级。"""
+        result = _builder(tmp_path).build_system_prompt()
+
+        assert "only source of truth for the working directory" in result
+
+    def test_current_project_is_last_statement_about_the_working_dir(self, tmp_path: Path):
+        """运行时值必须排在记忆**之后**——实测冲突时模型信的是更靠下的那条。
+
+        事故现场：长期记忆里写着 `Current working directory: D:\\test`，而
+        `# Current Project` 排在它前面，模型于是回答「根据之前的上下文，当前工作
+        目录是 D:\\test」，把文件写去了 D:\\test。
+        """
+        (tmp_path / "memory").mkdir()
+        (tmp_path / "memory" / "MEMORY.md").write_text(
+            "# Long-term Memory\n\n## Preferences\n\n- Reply in Chinese\n",
+            encoding="utf-8",
+        )
+
+        result = _builder(tmp_path).build_system_prompt()
+
+        # 记忆确实被注入了，否则这条断言等于没测
+        assert "# Memory" in result
+        assert result.rindex("# Current Project") > result.index("# Memory")
+
+
+class TestStaleWorkingDirNeutralization:
+    """记忆里对工作目录的断言在注入前必须作废。
+
+    工作目录是每轮会变的运行时值，长期记忆里的那一行只会是**历史残留**——
+    2026-09-16 那批会话真的跑在 `D:\\test` 上，Dream 就把它写进了 MEMORY.md，
+    之后每个会话都被这行注入，把用户设置里的工作空间顶掉。
+    """
+
+    def test_english_claim_is_neutralized_in_prompt(self, tmp_path: Path):
+        agent_home = tmp_path / "agent-home"
+        project = tmp_path / "project"
+        (agent_home / "memory").mkdir(parents=True)
+        (project).mkdir()
+        (agent_home / "memory" / "MEMORY.md").write_text(
+            "# Long-term Memory\n\n## Project Context\n\n"
+            "- Current working directory: D:\\test\n"
+            "- Project goal: daily AI news\n",
+            encoding="utf-8",
+        )
+
+        result = ContextBuilder(agent_home).build_system_prompt(workspace=project)
+
+        assert "D:\\test" not in result
+        assert "Project goal: daily AI news" in result
+        assert f"Working directory: {project.resolve()}" in result
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "- Current working directory: D:\\test",
+            "* current working directory = /tmp/old",
+            "Current Working Directory：D:\\test",
+            "- 当前工作目录: D:\\test",
+            "当前工作目录：D:\\test",
+            "工作目录为 D:\\test",
+        ],
+    )
+    def test_claim_variants_are_neutralized(self, line: str):
+        from nanobot.agent.context import neutralize_stale_working_dir
+
+        out = neutralize_stale_working_dir(line)
+
+        assert "D:\\test" not in out
+        assert "/tmp/old" not in out
+        assert "omitted" in out
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "- Project goal: daily AI news",
+            "- The repo lives in packages/map",
+            "- 记忆文件在 ~/.nanowork/memory/ 下",
+            "- Skill paths are loaded from the workspace",
+        ],
+    )
+    def test_unrelated_lines_are_kept_verbatim(self, line: str):
+        from nanobot.agent.context import neutralize_stale_working_dir
+
+        assert neutralize_stale_working_dir(line) == line
+
+    def test_empty_memory_is_a_noop(self):
+        from nanobot.agent.context import neutralize_stale_working_dir
+
+        assert neutralize_stale_working_dir("") == ""
+

@@ -435,6 +435,8 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
         prune_dream_sessions = MemoryStore.prune_dream_sessions
 
         store = loop.context.memory
+        # [LOCAL PATCH] FR-4.6：审查闸门默认开；开时产物写候选区、不直接改正式文件。
+        require_review = loop.dream_require_review
         content = ""
         resp = None
         diff_body = ""
@@ -455,32 +457,46 @@ async def cmd_dream(ctx: CommandContext) -> OutboundMessage:
                 prompt,
                 session_key=key,
                 ephemeral=True,
-                tools=store.build_dream_tools(),
+                tools=store.build_dream_tools(require_review=require_review),
                 on_progress=_silent,
                 runtime=dream_runtime,
             )
             elapsed = time.monotonic() - t0
-            # The real file delta grounds the audit record; normal completion
-            # decides whether this history batch has finished processing.
-            diff_body = store.dream_content_diff()
             completed = MemoryStore.dream_run_completed(resp)
             if completed:
                 store.set_last_dream_cursor(last_cursor)
-                if diff_body:
-                    content = f"Dream completed in {elapsed:.1f}s."
+                if require_review:
+                    # 产物在候选区，等用户审查；不在此提交正式文件。
+                    if store.has_dream_candidate():
+                        content = (
+                            f"Dream completed in {elapsed:.1f}s; "
+                            "proposed memory changes are pending review."
+                        )
+                    else:
+                        content = f"Dream completed in {elapsed:.1f}s; no memory changes."
                 else:
-                    content = f"Dream completed in {elapsed:.1f}s; no memory changes."
+                    # 闸门关：旧行为，直接增量提交正式文件。
+                    diff_body = store.dream_content_diff()
+                    if diff_body:
+                        content = f"Dream completed in {elapsed:.1f}s."
+                    else:
+                        content = f"Dream completed in {elapsed:.1f}s; no memory changes."
             else:
                 reason = MemoryStore.dream_incompletion_reason(resp)
+                # 未完成：若开了闸门，丢弃半成品候选，避免留下不一致待审项。
+                if require_review:
+                    store.reject_dream_candidate()
                 content = (
                     f"Dream did not complete after {elapsed:.1f}s ({reason}); "
                     "memory cursor was not advanced."
                 )
         except Exception as e:
             elapsed = time.monotonic() - t0
+            if require_review:
+                store.reject_dream_candidate()
             content = f"Dream failed after {elapsed:.1f}s: {e}"
         finally:
-            if store.git.is_initialized():
+            if not require_review and store.git.is_initialized():
                 commit_msg = build_dream_commit_message("dream: manual run", diff_body)
                 sha = store.git.auto_commit(commit_msg)
                 if sha:
@@ -532,6 +548,66 @@ async def cmd_dream_prompt(ctx: CommandContext) -> OutboundMessage:
             "- Run `/dream-prompt init` to create an editable copy."
         )
 
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
+# [LOCAL PATCH] FR-4.6：Dream 审查闸门的审查 / 采纳 / 丢弃命令。
+# 客户端记忆页（计划 B3-02 ③）会复用同一套 store 方法（has/compute/accept/reject）。
+async def cmd_dream_review(ctx: CommandContext) -> OutboundMessage:
+    """Show the pending Dream candidate changes (new / modified / deleted)."""
+    store = ctx.loop.context.memory
+    if not store.has_dream_candidate():
+        content = "No Dream changes are pending review."
+    else:
+        diff = store.compute_dream_candidate_diff()
+        lines = ["Dream proposed the following memory changes (pending review):", ""]
+        for name in ("MEMORY.md", "SOUL.md", "USER.md"):
+            entry = diff.get(name)
+            if entry is None or entry["status"] == "unchanged":
+                continue
+            lines.append(f"- `{name}`: {entry['status']}")
+        lines.append("")
+        lines.append("Use `/dream-accept` to apply them, or `/dream-reject` to discard.")
+        content = "\n".join(lines)
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
+async def cmd_dream_accept(ctx: CommandContext) -> OutboundMessage:
+    """Accept the pending Dream candidate and write it back to the real files."""
+    store = ctx.loop.context.memory
+    if not store.has_dream_candidate():
+        content = "No Dream changes are pending review."
+    else:
+        changed = store.accept_dream_candidate()
+        content = (
+            f"Accepted Dream changes; {changed} memory file(s) updated."
+        )
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=content,
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
+async def cmd_dream_reject(ctx: CommandContext) -> OutboundMessage:
+    """Discard the pending Dream candidate without touching the real files."""
+    store = ctx.loop.context.memory
+    if not store.has_dream_candidate():
+        content = "No Dream changes are pending review."
+    else:
+        store.reject_dream_candidate()
+        content = "Discarded the pending Dream candidate; no memory files were changed."
     return OutboundMessage(
         channel=ctx.msg.channel,
         chat_id=ctx.msg.chat_id,
@@ -1060,6 +1136,10 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.prefix("/dream-restore ", cmd_dream_restore)
     router.exact("/dream-prompt", cmd_dream_prompt)
     router.prefix("/dream-prompt ", cmd_dream_prompt)
+    # [LOCAL PATCH] FR-4.6：Dream 审查闸门命令
+    router.exact("/dream-review", cmd_dream_review)
+    router.exact("/dream-accept", cmd_dream_accept)
+    router.exact("/dream-reject", cmd_dream_reject)
     router.exact("/evaluator-prompt", cmd_evaluator_prompt)
     router.prefix("/evaluator-prompt ", cmd_evaluator_prompt)
     router.exact("/skill", cmd_skill)

@@ -104,7 +104,12 @@ class ToolApprovalHook(AgentHook):
         # （`_decide_for_each_hook` 调用每一个钩子，两道门必须各自判断不介入。）
         if agent_blocks_tool(scope, tool_call.name) is not None:
             return None
-        if not self._policy.requires_approval(tool_call.name):
+        # [LOCAL PATCH] 「本会话始终允许」：用户在上一次同类调用上点过，就
+        # 不再为同一个工具重复弹窗。查询按**会话键**分片，因此换会话即失效。
+        if not self._policy.requires_approval(
+            tool_call.name,
+            always_allowed=self._registry.always_allowed(context.session_key),
+        ):
             return None
 
         if self._on_progress is None or not on_progress_accepts_approval_requests(
@@ -124,6 +129,8 @@ class ToolApprovalHook(AgentHook):
             ),
             session_key=context.session_key,
             call_id=getattr(tool_call, "id", None) or None,
+            # 与下面 wait_for 的超时**同源**：IM 卡片会把这里写进「N 分钟内回复」。
+            timeout_seconds=self._policy.timeout_seconds,
         )
         future = self._registry.register(request)
         try:

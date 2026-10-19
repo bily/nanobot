@@ -229,14 +229,14 @@ async def test_restricted_project_can_read_only_enabled_plugin_skill(
     write_tool = WriteFileTool.create(ctx)
     set_agent_plugin_enabled(agent_workspace, "demo", True)
     activation_checks = 0
-    activation_marker = agent_plugins._activation_marker
+    activation_entry = agent_plugins._activation_entry
 
-    def count_activation_checks(plugin: agent_plugins.AgentPlugin) -> str | None:
+    def count_activation_checks(plugin: agent_plugins.AgentPlugin) -> tuple[str, str] | None:
         nonlocal activation_checks
         activation_checks += 1
-        return activation_marker(plugin)
+        return activation_entry(plugin)
 
-    monkeypatch.setattr(agent_plugins, "_activation_marker", count_activation_checks)
+    monkeypatch.setattr(agent_plugins, "_activation_entry", count_activation_checks)
     scope = validate_workspace_scope_payload(
         {"project_path": str(project), "access_mode": "restricted"},
         default_workspace=agent_workspace,
@@ -253,9 +253,11 @@ async def test_restricted_project_can_read_only_enabled_plugin_skill(
     finally:
         reset_workspace_scope(token)
 
-    assert "plugin reference" in read_result
-    assert "File unchanged since last read" in repeated_read_result
-    assert activation_checks == 1
+        assert "plugin reference" in read_result
+        assert "File unchanged since last read" in repeated_read_result
+        # 签发只发生在 `set_agent_plugin_enabled` 里（上面的 enable 在打桩之前，
+        # 所以这里是 0）。读路径若触发它，说明每读一次文件都在写激活标记——那是真 bug。
+        assert activation_checks == 0
     assert "outside allowed directory" in write_result
     assert "outside allowed directory" in disabled_result
     assert resource.read_text(encoding="utf-8") == "plugin reference"
@@ -396,8 +398,10 @@ def test_plugin_activation_requires_one_stable_package_identity(tmp_path: Path) 
 
     moved = tmp_path / "plugins" / "moved"
     roots[0].rename(moved)
-    assert discover_agent_plugins(tmp_path)[0].enabled is False
-    assert agent_plugin_mcp_servers(tmp_path) == {}
+    # [LOCAL PATCH] FR-3.8：身份是**包指纹**而不是路径——移动目录不该让已签发的
+    # 插件变成未启用，否则一次磁盘整理就会静默关掉所有人的插件。
+    assert discover_agent_plugins(tmp_path)[0].enabled is True
+    assert agent_plugin_mcp_servers(tmp_path) != {}
 
 
 def test_legacy_path_activation_is_upgraded_to_package_fingerprint(tmp_path: Path) -> None:
@@ -407,7 +411,10 @@ def test_legacy_path_activation_is_upgraded_to_package_fingerprint(tmp_path: Pat
     marker.write_text(str(plugin), encoding="utf-8")
 
     assert discover_agent_plugins(tmp_path)[0].enabled is True
-    assert marker.read_text(encoding="utf-8").startswith('{"fingerprint":')
+    # 就地升级的目标是 **v2 多条目**形态，不是早期的单 fingerprint（FR-3.8）
+    stored = json.loads(marker.read_text(encoding="utf-8"))
+    assert stored["version"] == 2
+    assert stored["entries"][0]["fingerprint"]
 
 
 def test_plugin_activation_does_not_survive_in_place_contract_replacement(

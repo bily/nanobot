@@ -1657,7 +1657,7 @@ def test_drop_malformed_tool_calls_trims_response():
         finish_reason="tool_calls",
         provider_state=candidate_state,
     )
-    dropped, all_dropped, orig = AgentRunner._drop_malformed_tool_calls(response)
+    dropped, all_dropped, orig, bad_args_len = AgentRunner._drop_malformed_tool_calls(response)
     assert [tc.name for tc in response.tool_calls] == ["read_file"]
     assert response.provider_state is None
     assert response.finish_reason == "tool_calls"
@@ -1676,7 +1676,7 @@ def test_drop_malformed_tool_calls_all_bad_disables_execution():
         tool_calls=[ToolCallRequest(id="1", name=None, arguments={})],
         finish_reason="tool_calls",
     )
-    dropped, all_dropped, orig = AgentRunner._drop_malformed_tool_calls(response)
+    dropped, all_dropped, orig, bad_args_len = AgentRunner._drop_malformed_tool_calls(response)
     assert response.tool_calls == []
     assert response.finish_reason == "stop"
     assert response.should_execute_tools is False
@@ -1690,10 +1690,84 @@ def test_drop_malformed_returns_tuple_no_calls():
     from nanobot.agent.runner import AgentRunner
 
     response = LLMResponse(content="hi", finish_reason="stop")
-    dropped, all_dropped, orig = AgentRunner._drop_malformed_tool_calls(response)
+    dropped, all_dropped, orig, bad_args_len = AgentRunner._drop_malformed_tool_calls(response)
     assert dropped == 0
     assert all_dropped is False
     assert orig == "stop"
+    assert bad_args_len == 0
+
+
+def test_drop_malformed_tool_calls_drops_truncated_arguments():
+    """参数被输出上限截断（半截 JSON）的调用必须被丢弃，并报出参数长度。
+
+    2026-09-29 事故：`write_file` 的 25186 字符参数停在 JS 函数体中间，引擎把它当字符串
+    拒了、错误只回给模型，用户侧看到的是「已完成」且文件不存在。丢弃比放行更重要——
+    放进历史会被 `json_repair` 修成假参数，之后每轮重放。
+    """
+    from nanobot.agent.runner import AgentRunner
+
+    truncated = '{"path": "D:\\\\aaa\\\\tetris.html", "content": "<!DOCTYPE html>…setDas(dir) { das'
+    response = LLMResponse(
+        content="我先创建游戏文件，然后用 Node 对其中的游戏逻辑做一次真实的运行验证。",
+        tool_calls=[ToolCallRequest(id="1", name="write_file", arguments=truncated)],
+        finish_reason="tool_calls",
+    )
+
+    dropped, all_dropped, orig, bad_args_len = AgentRunner._drop_malformed_tool_calls(response)
+
+    assert response.tool_calls == []
+    assert response.finish_reason == "stop"
+    assert response.should_execute_tools is False
+    assert (dropped, all_dropped, orig) == (1, True, "tool_calls")
+    assert bad_args_len == len(truncated)
+
+
+def test_drop_malformed_keeps_valid_call_next_to_truncated_one():
+    """混合回合：合法调用照常执行，被截断的那个单独丢掉。"""
+    from nanobot.agent.runner import AgentRunner
+
+    truncating = '{"path": "a.html"'
+    response = LLMResponse(
+        content=None,
+        tool_calls=[
+            ToolCallRequest(id="1", name="write_file", arguments=truncating),
+            ToolCallRequest(id="2", name="list_dir", arguments={"path": "D:\\aaa"}),
+        ],
+        finish_reason="tool_calls",
+    )
+
+    dropped, all_dropped, orig, bad_args_len = AgentRunner._drop_malformed_tool_calls(response)
+
+    assert [tc.name for tc in response.tool_calls] == ["list_dir"]
+    assert (dropped, all_dropped, orig) == (1, False, "tool_calls")
+    assert bad_args_len == len(truncating)
+    assert response.should_execute_tools is True
+
+
+def test_malformed_retry_note_teaches_chunked_writes():
+    """重试提示要说清「可能是被截断」并给出分片写法，否则模型只会再撞一次同一个上限。"""
+    from nanobot.agent.runner import AgentRunner
+
+    messages = [{"role": "user", "content": "帮我写一个俄罗斯方块小游戏，保存在本地。"}]
+    note = AgentRunner._malformed_tool_call_retry_messages(
+        messages, "我先创建游戏文件。", 25186,
+    )[-1]["content"]
+
+    # 原列表不被就地改写（追加的是副本）
+    assert messages == [{"role": "user", "content": "帮我写一个俄罗斯方块小游戏，保存在本地。"}]
+    assert "25186" in note
+    assert "append=true" in note
+    assert "我先创建游戏文件。" in note
+
+
+def test_malformed_retry_note_omits_chunking_without_arguments_evidence():
+    """名字缺失导致的重试不带分片建议：那是另一类故障，塞无关指引只会分散模型。"""
+    from nanobot.agent.runner import AgentRunner
+
+    note = AgentRunner._malformed_tool_call_retry_messages([], None)[-1]["content"]
+
+    assert "append=true" not in note
+    assert "missing/non-string tool name" in note
 
 
 def test_strip_malformed_tool_calls_keeps_valid_calls_in_history():

@@ -203,7 +203,7 @@ class TestDreamRunCompletion:
 
 class TestDreamTools:
     def test_dream_tools_are_restricted_to_file_edits(self, store):
-        tools = store.build_dream_tools()
+        tools = store.build_dream_tools(require_review=False)
 
         assert set(tools.tool_names) == {
             "apply_patch",
@@ -214,7 +214,7 @@ class TestDreamTools:
 
     @pytest.mark.asyncio
     async def test_dream_can_edit_canonical_memory_files(self, store):
-        tools = store.build_dream_tools()
+        tools = store.build_dream_tools(require_review=False)
 
         memory_result = await tools.execute(
             "apply_patch",
@@ -254,7 +254,7 @@ class TestDreamTools:
 
     @pytest.mark.asyncio
     async def test_dream_can_write_workspace_skills(self, store):
-        tools = store.build_dream_tools()
+        tools = store.build_dream_tools(require_review=False)
         target = store.workspace / "skills" / "demo" / "SKILL.md"
 
         result = await tools.execute(
@@ -270,7 +270,7 @@ class TestDreamTools:
 
     @pytest.mark.asyncio
     async def test_dream_tools_keep_internal_write_scope_under_full_access(self, store):
-        tools = store.build_dream_tools()
+        tools = store.build_dream_tools(require_review=False)
         scope = default_workspace_scope(store.workspace, restrict_to_workspace=False)
         outside = store.workspace.parent / f"{store.workspace.name}-outside"
         outside.mkdir()
@@ -305,7 +305,7 @@ class TestDreamTools:
 
     @pytest.mark.asyncio
     async def test_dream_cannot_modify_memory_internal_files(self, store):
-        tools = store.build_dream_tools()
+        tools = store.build_dream_tools(require_review=False)
         store.history_file.write_text("before\n", encoding="utf-8")
         store._dream_cursor_file.write_text("1", encoding="utf-8")
 
@@ -346,7 +346,7 @@ class TestDreamTools:
 
     @pytest.mark.asyncio
     async def test_dream_cannot_create_children_under_canonical_files(self, store):
-        tools = store.build_dream_tools()
+        tools = store.build_dream_tools(require_review=False)
 
         memory_child = store.memory_file / "evil.txt"
         user_child = store.user_file / "evil.txt"
@@ -536,7 +536,7 @@ class TestEphemeralDirect:
             "test",
             session_key="dream:handled-tool-error",
             ephemeral=True,
-            tools=store.build_dream_tools(),
+            tools=store.build_dream_tools(require_review=False),
         )
 
         assert resp is not None
@@ -584,7 +584,7 @@ class TestEphemeralDirect:
             prompt,
             session_key="dream:test",
             ephemeral=True,
-            tools=store.build_dream_tools(),
+            tools=store.build_dream_tools(require_review=False),
         )
 
         messages = captured["messages"]
@@ -642,7 +642,7 @@ class TestEphemeralDirect:
             prompt,
             session_key=session_key,
             ephemeral=True,
-            tools=store.build_dream_tools(),
+            tools=store.build_dream_tools(require_review=False),
         )
 
         messages = captured["messages"]

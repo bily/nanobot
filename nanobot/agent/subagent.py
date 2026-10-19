@@ -13,10 +13,12 @@ from typing import Any, Callable, NotRequired, TypedDict
 from loguru import logger
 
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
+from nanobot.agent.hooks.agent_tools import AgentToolPolicyHook
 from nanobot.agent.hooks.session_mode import SessionModeHook
 from nanobot.agent.hooks.tool_approval import ToolApprovalHook
 from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.base import ToolResult
+from nanobot.agent.subagent_progress import emit_subagent_event
 from nanobot.agent.tools.context import (
     RequestContext,
     ToolContext,
@@ -69,10 +71,23 @@ class SubagentStatus:
 class _SubagentHook(AgentHook):
     """Hook for subagent execution — logs tool calls and updates status."""
 
-    def __init__(self, task_id: str, status: SubagentStatus | None = None) -> None:
+    def __init__(
+        self,
+        task_id: str,
+        status: SubagentStatus | None = None,
+        *,
+        progress_label: str | None = None,
+    ) -> None:
         super().__init__()
         self._task_id = task_id
         self._status = status
+        # [LOCAL PATCH] FR-2.5 第 4 步：把工具执行进度按子代理归属推出去，
+        # 客户端据此渲染「子代理分组」。没有出口时全部静默跳过。
+        self._progress_label = progress_label
+
+    @property
+    def _attribution(self) -> dict[str, Any]:
+        return {"id": self._task_id, "label": self._progress_label or self._task_id}
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         for tool_call in context.tool_calls:
@@ -80,6 +95,14 @@ class _SubagentHook(AgentHook):
             logger.debug(
                 "Subagent [{}] executing: {} with arguments: {}",
                 self._task_id, tool_call.name, args_str,
+            )
+            await emit_subagent_event(
+                "tool",
+                subagent=self._attribution,
+                extra={
+                    "tool": tool_call.name,
+                    "iteration": context.iteration,
+                },
             )
 
     async def after_iteration(self, context: AgentHookContext) -> None:
@@ -251,6 +274,7 @@ class SubagentManager:
         origin_message_id: str | None = None,
         temperature: float | None = None,
         workspace_scope: WorkspaceScope | None = None,
+        persona: str | None = None,
         *,
         runtime: LLMRuntime | None = None,
     ) -> str:
@@ -286,6 +310,7 @@ class SubagentManager:
                 runtime,
                 origin_message_id,
                 workspace_scope,
+                persona=persona,
             )
         )
         self._running_tasks[task_id] = bg_task
@@ -315,6 +340,7 @@ class SubagentManager:
         origin_message_id: str | None = None,
         temperature: float | None = None,
         workspace_scope: WorkspaceScope | None = None,
+        persona: str | None = None,
         *,
         runtime: LLMRuntime | None = None,
     ) -> str:
@@ -350,6 +376,7 @@ class SubagentManager:
                 origin_message_id,
                 workspace_scope,
                 announce=False,
+                persona=persona,
             )
         )
         self._running_tasks[task_id] = inline_task
@@ -379,6 +406,7 @@ class SubagentManager:
         origin_message_id: str | None = None,
         workspace_scope: WorkspaceScope | None = None,
         *,
+        persona: str | None = None,
         announce: bool = True,
     ) -> str:
         """Wait for capacity, then execute one subagent task."""
@@ -395,6 +423,7 @@ class SubagentManager:
                 origin_message_id,
                 workspace_scope,
                 announce=announce,
+                persona=persona,
             )
 
     async def _run_admitted_subagent(
@@ -408,10 +437,17 @@ class SubagentManager:
         origin_message_id: str | None = None,
         workspace_scope: WorkspaceScope | None = None,
         *,
+        persona: str | None = None,
         announce: bool = True,
     ) -> str:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
+        # [LOCAL PATCH] FR-2.5 第 4 步：开始事件带 task 摘要，客户端分组行才不是空的。
+        await emit_subagent_event(
+            "started",
+            subagent={"id": task_id, "label": label},
+            extra={"task": task[:500]},
+        )
 
         async def _on_checkpoint(payload: dict[str, Any]) -> None:
             status.phase = payload.get("phase", status.phase)
@@ -425,7 +461,7 @@ class SubagentManager:
                 cfg.restrict_to_workspace = workspace_scope.restrict_to_workspace
             # Construct from the agent workspace; the bound scope below supplies the project cwd.
             tools = self._build_tools(tools_config=cfg)
-            system_prompt = self._build_subagent_prompt(workspace=root)
+            system_prompt = self._build_subagent_prompt(workspace=root, persona=persona)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
@@ -460,11 +496,23 @@ class SubagentManager:
                     # 拒绝原因会作为工具结果回注，父代理据此改道。
                     # SessionModeHook 同理由此挂上：ask/plan 下 spawn 本身就被拒，
                     # 但作用域一旦带着只读模式绑进来，就不该指望「父代理进不来」来兜底。
+                    #
+                    # [LOCAL PATCH] FR-2.2 / FR-2.4：补上 AgentToolPolicyHook。
+                    # 缺了它，子代理就是 **Agent 工具白名单的旁路** —— 父代理被
+                    # `tool_deny` 挡住的写工具，只要 `spawn` 还在白名单里，就能让
+                    # 子代理代劳（`_build_tools` 是全量加载的，不受父策略约束）。
+                    # 最小权限于是退化成「只对直接调用生效的礼貌」。
+                    #
+                    # 策略不需要另传：`spawn` 工具把 `current_workspace_scope()`
+                    # （父作用域，已含 tool_allow / tool_deny）原样带进来，本函数
+                    # 又在下面 bind 了它 —— 所以「权限单调递减」是**继承**出来的，
+                    # 而不是靠调用方记得再声明一遍（后者必然会被漏掉）。
                     hook=CompositeHook(
                         [
-                            _SubagentHook(task_id, status),
+                            _SubagentHook(task_id, status, progress_label=label),
                             ToolApprovalHook(),
                             SessionModeHook(),
+                            AgentToolPolicyHook(),
                         ]
                     ),
                     max_iterations_message="Task completed but no final response was generated.",
@@ -493,6 +541,14 @@ class SubagentManager:
                 final_result = result.final_content or "Task completed but no final response was generated."
                 final_status = "ok"
                 logger.info("Subagent [{}] completed successfully", task_id)
+            await emit_subagent_event(
+                "done" if final_status == "ok" else "error",
+                subagent={"id": task_id, "label": label},
+                extra={
+                    "iterations": status.iteration,
+                    "tools": [e.get("name", "") for e in status.tool_events],
+                },
+            )
             if announce:
                 await self._announce_result(
                     task_id,
@@ -510,6 +566,11 @@ class SubagentManager:
             status.error = str(e)
             logger.exception("Subagent [{}] failed", task_id)
             final_result = f"Error: {e}"
+            await emit_subagent_event(
+                "error",
+                subagent={"id": task_id, "label": label},
+                extra={"error": str(e)},
+            )
             if announce:
                 await self._announce_result(
                     task_id,
@@ -567,8 +628,19 @@ class SubagentManager:
         await self.bus.publish_inbound(msg)
         logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
 
-    def _build_subagent_prompt(self, workspace: Path | None = None) -> str:
-        """Build a focused system prompt for the subagent."""
+    def _build_subagent_prompt(
+        self,
+        workspace: Path | None = None,
+        persona: str | None = None,
+    ) -> str:
+        """Build a focused system prompt for the subagent.
+
+        [LOCAL PATCH] FR-2.4：`persona` 是**追加**而不是覆盖。
+
+        人设（专家的 systemPrompt）只描述「你是谁、怎么说话」；而本函数渲染的模板里
+        还装着**工作区边界与技能清单**——那是安全边界，不是风格。允许覆盖等于让调用方
+        一句话把子代理的工作区约束抹掉，于是「派发给成员」会顺手开出一条越界通道。
+        """
         from nanobot.agent.skills import SkillsLoader
 
         agent_workspace = self.workspace.expanduser().resolve()
@@ -585,7 +657,7 @@ class SubagentManager:
             if agent_workspace != project_workspace
             else "memory/history.jsonl"
         )
-        return render_template(
+        base = render_template(
             "agent/subagent_system.md",
             workspace=str(project_workspace),
             agent_workspace=str(agent_workspace),
@@ -595,6 +667,10 @@ class SubagentManager:
             # 注意 `workspace` 是**模板变量**、`override_root` 是**覆盖根**，两者不可合并。
             override_root=project_workspace,
         )
+        extra = (persona or "").strip()
+        if not extra:
+            return base
+        return f"{base}\n\n{extra}"
 
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""

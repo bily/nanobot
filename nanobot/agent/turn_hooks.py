@@ -16,6 +16,10 @@ from nanobot.agent.hook import (
     CompositeHook,
 )
 from nanobot.agent.hooks.agent_tools import create_agent_tool_policy_hook
+from nanobot.agent.hooks.plugin_tools import (
+    DeclaredToolPolicy,
+    create_declared_tool_policy_hook,
+)
 from nanobot.agent.hooks.session_mode import create_session_mode_hook
 from nanobot.agent.hooks.tool_approval import create_tool_approval_hook
 from nanobot.agent.progress_hook import AgentProgressHook
@@ -42,6 +46,10 @@ class AgentTurnHookSpec:
     ephemeral: bool = False
     run_extra_hooks_for_ephemeral: bool = False
     attributes: dict[str, Any] | None = None
+    # [LOCAL PATCH] FR-3.12：装配期算好的技能 / 插件工具声明（只收紧）。
+    # 刻意**不在钩子里现算**：声明来自磁盘（技能 frontmatter / 插件清单），
+    # 而工具执行在热路径上 —— 每调一次工具扫一遍盘是不能接受的。
+    declared_tools: DeclaredToolPolicy | None = None
 
 
 def build_agent_turn_hook(spec: AgentTurnHookSpec) -> AgentHook:
@@ -86,6 +94,14 @@ def build_agent_turn_hook(spec: AgentTurnHookSpec) -> AgentHook:
     agent_tool_hook = create_agent_tool_policy_hook(turn_context)
     if agent_tool_hook is not None:
         baseline_chain.append(agent_tool_hook)
+
+    # [LOCAL PATCH] nanowork：技能 / 插件声明的工具白名单（FR-3.12）也是基线能力。
+    # **位置不改变语义**：合并器只收集 deny（见 `agent/hook.py` 的 `_decide_for_each_hook`），
+    # 所以这道门放哪儿都只能往里加拒绝、盖不掉审批门的裁决。排在最后只是因为
+    # 读起来最顺：先基线（模式 / 审批 / Agent 授权），再「作者进一步收窄」。
+    declared_tool_hook = create_declared_tool_policy_hook(turn_context, spec.declared_tools)
+    if declared_tool_hook is not None:
+        baseline_chain.append(declared_tool_hook)
 
     if spec.ephemeral and not spec.run_extra_hooks_for_ephemeral:
         return (

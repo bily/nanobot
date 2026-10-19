@@ -40,7 +40,7 @@ class _FakeStore:
     def build_dream_prompt(self):
         return self._dream_prompt_result
 
-    def build_dream_tools(self):
+    def build_dream_tools(self, *, require_review: bool = True):
         return None
 
     def set_last_dream_cursor(self, value: int) -> None:
@@ -48,6 +48,12 @@ class _FakeStore:
 
     def dream_content_diff(self) -> str:
         return self._content_diff
+
+    def has_dream_candidate(self) -> bool:
+        return getattr(self, "_has_candidate", False)
+
+    def reject_dream_candidate(self) -> None:
+        self.rejected = True
 
     def compact_history(self) -> None:
         self.compact_history_called = True
@@ -67,6 +73,7 @@ class _FakeGit:
         self._diff_map = diff_map or {}
         self._revert_result = revert_result
         self.revert_calls: list[tuple[str, str | None]] = []
+        self.auto_commit_calls: int = 0
 
     def is_initialized(self) -> bool:
         return self._initialized
@@ -97,6 +104,7 @@ class _FakeGit:
         return self._revert_result
 
     def auto_commit(self, message: str) -> str | None:
+        self.auto_commit_calls = getattr(self, "auto_commit_calls", 0) + 1
         return None
 
 
@@ -130,6 +138,7 @@ def _make_dream_ctx(tmp_path) -> tuple[CommandContext, _FakeBus]:
         bus=bus,
         context=SimpleNamespace(memory=store, timezone="UTC"),
         sessions=_make_sessions(tmp_path),
+        dream_require_review=False,
     )
     ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/dream", args="", loop=loop)
     return ctx, bus
@@ -182,6 +191,7 @@ async def test_dream_internal_run_silences_progress(tmp_path) -> None:
         sessions=_make_sessions(tmp_path),
         process_direct=process_direct,
         dream_runtime=lambda: dream_runtime,
+        dream_require_review=False,
     )
     ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/dream", args="", loop=loop)
 
@@ -234,6 +244,7 @@ def _build_runnable_dream(
         sessions=_make_sessions(tmp_path),
         process_direct=process_direct,
         dream_runtime=lambda: None,
+        dream_require_review=False,
     )
     ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/dream", args="", loop=loop)
     return ctx, store
@@ -319,6 +330,7 @@ async def test_dream_noop_batch_unlocks_following_history(tmp_path) -> None:
         sessions=_make_sessions(tmp_path),
         process_direct=process_direct,
         dream_runtime=lambda: None,
+        dream_require_review=False,
     )
     ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/dream", args="", loop=loop)
 
@@ -346,6 +358,127 @@ async def test_dream_non_git_falls_back_to_completion_gate(tmp_path) -> None:
     await cmd_dream(ctx)
     await asyncio.sleep(0)
     assert store._last_dream_cursor == 42  # advanced via completion fallback
+
+
+# --- FR-4.6 Dream review gate: gate-open (default) command behavior ---
+
+def _build_gated_dream(
+    tmp_path,
+    *,
+    has_candidate: bool,
+    stop_reason: str = "completed",
+) -> tuple[CommandContext, _FakeStore, _FakeGit]:
+    """Build a /dream ctx with the review gate OPEN (require_review=True)."""
+    msg = InboundMessage(channel="cli", sender_id="u1", chat_id="direct", content="/dream")
+    git = _FakeGit(initialized=True)
+    store = _FakeStore(
+        git,
+        last_dream_cursor=5,
+        dream_prompt_result=("dream prompt", 42),
+        content_diff="SOUL.md: +1 -0",
+    )
+    store._has_candidate = has_candidate
+
+    async def process_direct(*args, **kwargs):
+        return OutboundMessage(
+            channel="cli",
+            chat_id="direct",
+            content="done",
+            metadata={"_stop_reason": stop_reason},
+        )
+
+    bus = _FakeBus()
+    loop = SimpleNamespace(
+        bus=bus,
+        context=SimpleNamespace(memory=store, timezone="UTC"),
+        sessions=_make_sessions(tmp_path),
+        process_direct=process_direct,
+        dream_runtime=lambda: None,
+        dream_require_review=True,
+    )
+    ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/dream", args="", loop=loop)
+    return ctx, store, git
+
+
+@pytest.mark.asyncio
+async def test_dream_gate_open_pending_review_no_autocommit(tmp_path) -> None:
+    """Gate open + candidate present → 'pending review' and NO auto-commit of real files."""
+    ctx, store, git = _build_gated_dream(tmp_path, has_candidate=True)
+    await cmd_dream(ctx)
+    await asyncio.sleep(0)
+    assert store._last_dream_cursor == 42  # completed → cursor advanced
+    content = ctx.loop.bus.outbound[0].content
+    assert "pending review" in content
+    assert git.auto_commit_calls == 0  # real files untouched until accepted
+
+
+@pytest.mark.asyncio
+async def test_dream_gate_open_no_candidate_no_changes(tmp_path) -> None:
+    """Gate open but Dream proposed nothing → 'no memory changes', still no commit."""
+    ctx, store, git = _build_gated_dream(tmp_path, has_candidate=False)
+    await cmd_dream(ctx)
+    await asyncio.sleep(0)
+    assert store._last_dream_cursor == 42
+    assert "no memory changes" in ctx.loop.bus.outbound[0].content
+    assert git.auto_commit_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_dream_gate_open_incomplete_discards_candidate(tmp_path) -> None:
+    """Gate open + incomplete run → candidate discarded, cursor held, no commit."""
+    ctx, store, git = _build_gated_dream(tmp_path, has_candidate=True, stop_reason="length")
+    await cmd_dream(ctx)
+    await asyncio.sleep(0)
+    assert store._last_dream_cursor == 5  # incomplete → cursor unchanged
+    assert "did not complete" in ctx.loop.bus.outbound[0].content
+    assert store.rejected is True
+    assert git.auto_commit_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_dream_accept_writes_back_and_reports_count(tmp_path) -> None:
+    """`/dream-accept` applies the candidate and reports the changed-file count."""
+    from nanobot.command.builtin import cmd_dream_accept
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "memory").mkdir()
+    store = MemoryStore(workspace)
+    store.write_memory("real")
+    store.build_dream_tools(require_review=True)
+    store.dream_candidate_dir.joinpath("MEMORY.md").write_text("proposal", encoding="utf-8")
+
+    msg = InboundMessage(channel="cli", sender_id="u1", chat_id="direct", content="/dream-accept")
+    loop = SimpleNamespace(context=SimpleNamespace(memory=store))
+    ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/dream-accept", args="", loop=loop)
+
+    out = await cmd_dream_accept(ctx)
+    assert store.memory_file.read_text(encoding="utf-8") == "proposal"
+    assert "1 memory file(s) updated" in out.content
+    assert not store.dream_candidate_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_dream_reject_discards_without_touching_real(tmp_path) -> None:
+    """`/dream-reject` drops the candidate and never modifies the real file."""
+    from nanobot.command.builtin import cmd_dream_reject
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "memory").mkdir()
+    store = MemoryStore(workspace)
+    store.write_memory("immutable")
+    store.build_dream_tools(require_review=True)
+    store.dream_candidate_dir.joinpath("MEMORY.md").write_text("hacked", encoding="utf-8")
+
+    msg = InboundMessage(channel="cli", sender_id="u1", chat_id="direct", content="/dream-reject")
+    loop = SimpleNamespace(context=SimpleNamespace(memory=store))
+    ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw="/dream-reject", args="", loop=loop)
+
+    out = await cmd_dream_reject(ctx)
+    assert store.memory_file.read_text(encoding="utf-8") == "immutable"
+    assert not store.dream_candidate_dir.exists()
+    assert "Discarded" in out.content
 
 
 @pytest.mark.asyncio

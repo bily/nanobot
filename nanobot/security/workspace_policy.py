@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable, Sequence
+
+if TYPE_CHECKING:  # 仅标注用：运行期导入会与 path_rules 成环（它要用本模块的 resolve_path）
+    from nanobot.security.path_rules import PathRule
 
 WORKSPACE_BOUNDARY_NOTE = (
     " (this is a hard policy boundary, not a transient failure; "
@@ -258,6 +261,8 @@ def resolve_allowed_path(
     write: bool = False,
     deny_write_by_default: bool = False,
     strict: bool = False,
+    rules: Sequence[PathRule] | None = None,
+    kind: str | None = None,
 ) -> Path:
     """Resolve a path and enforce containment in allowed roots when configured.
 
@@ -272,9 +277,46 @@ def resolve_allowed_path(
       both set, a write with no configured allow-list is refused instead of
       being treated as unrestricted. Off by default so upstream callers keep
       their existing semantics; the nanowork client turns it on.
+
+    [LOCAL PATCH] nanowork FR-8.13 adds **path-level rules** (compound
+    read/write/delete actions). Their position in the priority chain is the
+    thing to remember:
+
+    1. credential ``no_access`` (above) — unconditional; a rule **cannot**
+       override it (otherwise one ``read=allow`` hands out ``~/.ssh/id_rsa``);
+    2. workspace / allowed-root containment (below) — rules only ever *narrow*
+       what the boundary already permits;
+    3. **rules** — when one matches, its verdict for this action wins;
+    4. ``deny_write_by_default`` — the coarse fallback when no rule has an
+       opinion on *write* for this path. A rule that says ``write=allow``
+       therefore overrides it: otherwise this feature would only add finer
+       denials and never a precise grant.
+
+    ``kind`` names the action (``read`` / ``write`` / ``delete``). It defaults to
+    deriving from ``write`` so existing callers are unaffected; ``delete`` has to
+    be passed explicitly because delete reuses the write resolution path.
     """
+    action_kind = kind if kind in ("read", "write", "delete") else ("write" if write else "read")
     resolved = resolve_path(path, workspace, strict=False)
+    # ① 凭据守卫先于一切（含规则）
     require_no_access_free(resolved)
+
+    # ③ 路径规则。延迟导入：`path_rules` 要用本模块的 `resolve_path`，
+    #    顶层互导会成环。
+    if rules:
+        from nanobot.security.path_rules import match_path_rule
+
+        hit = match_path_rule(rules, resolved, action_kind)
+        if hit is not None:
+            if hit.verdict == "deny":
+                from nanobot.security.path_rules import rule_block_reason
+
+                raise WorkspaceBoundaryError(
+                    rule_block_reason(rules, resolved, action_kind)
+                    or f"The path '{path}' is denied by a path rule."
+                )
+            # 命中且允许 → 显式放开压过 default_deny_write（具体胜笼统）
+            deny_write_by_default = False
 
     files = list(extra_allowed_files or [])
     if allowed_root is None and not files:

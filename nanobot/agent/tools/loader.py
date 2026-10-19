@@ -107,12 +107,12 @@ class ToolLoader:
                     if registry.has(tool.name):
                         if is_plugin_source and tool.name in builtin_names:
                             logger.warning(
-                                "Plugin %s skipped: conflicts with built-in tool %s",
+                                "Plugin {} skipped: conflicts with built-in tool {}",
                                 cls_label, tool.name,
                             )
                             continue
                         logger.warning(
-                            "Tool name collision: %s from %s overwrites existing",
+                            "Tool name collision: {} from {} overwrites existing",
                             tool.name, cls_label,
                         )
                     registry.register(tool)

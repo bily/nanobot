@@ -48,6 +48,77 @@ class CronSchedule:
 
 
 @dataclass
+class CronDeliveryTarget:
+    """One external destination for a bound cron run's result (FR-5.6)."""
+
+    channel: str  # engine channel name, e.g. "wecom"
+    chat_id: str  # target conversation id on that channel
+
+    @classmethod
+    def from_store_dict(cls, data: dict[str, Any]) -> CronDeliveryTarget | None:
+        channel = str(data.get("channel") or "").strip()
+        chat_id = str(get_camel_snake(data, "chatId", "chat_id") or "").strip()
+        # A half-filled target can never be delivered to; dropping it here keeps
+        # "configured" and "actually pushable" the same thing.
+        if not channel or not chat_id:
+            return None
+        return cls(channel=channel, chat_id=chat_id)
+
+    def to_store_dict(self) -> dict[str, Any]:
+        """Back to the camelCase wire shape (see ``CronService._save_store``)."""
+        return {"channel": self.channel, "chatId": self.chat_id}
+
+
+@dataclass
+class CronDelivery:
+    """[LOCAL PATCH] FR-5.6: where else a bound job's result should be pushed.
+
+    Deliberately **separate** from ``deliver`` / ``channel`` / ``to`` on
+    :class:`CronPayload`.  Those three are the *pre*-session-bound routing
+    target: the loader migrates them into ``origin_*`` and clears them, and
+    :func:`is_bound_cron_job` treats their presence as "this job is not bound",
+    which disables the job.  This field is purely additive — the job keeps
+    executing in its bound session and a copy of the result is pushed to
+    ``targets`` after the turn finishes.
+    """
+
+    targets: list[CronDeliveryTarget] = field(default_factory=list)
+    # Validated where it is acted on (``bound_runner``) so the warning for an
+    # unknown value lives next to the code that has to cope with it.
+    # "complete" | "error" | "start" (see ``bound_runner._DELIVERY_MODES``).
+    # "milestone" — push at each key step — is intentionally **not** implemented:
+    # a bound job is a single agent turn, and inside it there is no step that is
+    # both user-meaningful and observable without turning the chat into a log.
+    on: str = "complete"
+
+    @classmethod
+    def from_store_dict(cls, data: Any) -> CronDelivery | None:
+        if not isinstance(data, dict):
+            return None
+        raw_targets = data.get("targets")
+        targets: list[CronDeliveryTarget] = []
+        if isinstance(raw_targets, list):
+            for item in raw_targets:
+                if not isinstance(item, dict):
+                    continue
+                target = CronDeliveryTarget.from_store_dict(item)
+                if target is not None:
+                    targets.append(target)
+        # No usable target ⇒ no delivery.  A config that would push nowhere must
+        # not read back as "configured", or callers would report success.
+        if not targets:
+            return None
+        return cls(targets=targets, on=str(data.get("on") or "complete"))
+
+    def to_store_dict(self) -> dict[str, Any]:
+        """Back to the camelCase wire shape (see ``CronService._save_store``)."""
+        return {
+            "targets": [target.to_store_dict() for target in self.targets],
+            "on": self.on,
+        }
+
+
+@dataclass
 class CronPayload:
     """What to do when the job runs."""
     kind: Literal["system_event", "agent_turn"] = "agent_turn"
@@ -61,6 +132,8 @@ class CronPayload:
     origin_channel: str | None = None
     origin_chat_id: str | None = None
     origin_metadata: dict[str, Any] = field(default_factory=dict)
+    # [LOCAL PATCH] FR-5.6 result push; see CronDelivery.
+    delivery: CronDelivery | None = None
 
     @classmethod
     def from_store_dict(cls, data: dict[str, Any]) -> CronPayload:
@@ -79,6 +152,7 @@ class CronPayload:
             origin_metadata=dict(
                 get_camel_snake(data, "originMetadata", "origin_metadata", {}) or {}
             ),
+            delivery=CronDelivery.from_store_dict(data.get("delivery")),
         )
 
 
@@ -159,7 +233,13 @@ class CronJob:
         kwargs["schedule"] = CronSchedule(
             **cast(dict[str, Any], kwargs.get("schedule", {"kind": "every"}))
         )
-        kwargs["payload"] = CronPayload(**cast(dict[str, Any], kwargs.get("payload", {})))
+        payload_kwargs = dict(cast(dict[str, Any], kwargs.get("payload", {})))
+        # `delivery` 走与磁盘路径**同一个**解析器：直接塞进来的裸 dict 会让投递代码
+        # 拿到一个没有 `.targets` 的对象，而报错发生在一次已经跑完的任务之后 —— 最难查。
+        raw_delivery = payload_kwargs.get("delivery")
+        if raw_delivery is not None and not isinstance(raw_delivery, CronDelivery):
+            payload_kwargs["delivery"] = CronDelivery.from_store_dict(raw_delivery)
+        kwargs["payload"] = CronPayload(**payload_kwargs)
         kwargs["state"] = CronJobState(**state_kwargs)
         return cls(**cast(Any, kwargs))
 

@@ -29,6 +29,23 @@ def test_coding_tool_descriptions_steer_editing_priority() -> None:
     assert "prefer apply_patch" in write_file
 
 
+def test_write_file_description_teaches_chunked_writes() -> None:
+    """分片写法只能从工具描述里学到，所以描述必须带上体积上限与 append 用法。
+
+    2026-09-29 事故里模型把整份游戏塞进一次调用，参数被输出上限截断成半截 JSON。
+    光有 append 参数不够——模型不会去猜它的存在。
+    """
+    tool = WriteFileTool()
+    description = tool.description.lower()
+    properties = tool.parameters["properties"]
+
+    assert "48000" in description
+    assert "in chunks" in description
+    assert "append=true" in description
+    assert properties["append"]["default"] is False
+    assert "chunks" in properties["content"]["description"].lower()
+
+
 def test_coding_tool_descriptions_steer_discovery() -> None:
     read_file = ReadFileTool().description.lower()
     find_files = FindFilesTool().description.lower()

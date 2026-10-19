@@ -16,6 +16,14 @@ def is_tool_error_result(result: Any) -> bool:
     return isinstance(result, ToolResult) and result.is_error
 
 
+# 参数诊断预览：长度 + 首尾各截这么多字符。
+#
+# 「got str」单独一句无法定位故障：看不出模型是传错了类型，还是它的 JSON 在写到一半时
+# 被输出长度上限截断（2026-09-29 事故：25186 字符的 write_file 参数停在一段 JS 函数体
+# 中间）。带上长度与首尾预览，日志与会话记录里才能一眼看出是哪一种。
+_ARGUMENT_PREVIEW_CHARS = 80
+
+
 class ToolRegistry:
     """
     Registry for agent tools.
@@ -107,6 +115,26 @@ class ToolRegistry:
 
         return self._cached_definitions
 
+    @staticmethod
+    def _describe_argument_shape(value: Any) -> str:
+        """Describe an unusable arguments payload so the failure is diagnosable.
+
+        字符串参数额外带长度与首尾预览：只有 ``str`` 这个类型名时，无法区分「模型传错了
+        类型」与「参数被输出长度上限截断成半截 JSON」（见 ``_ARGUMENT_PREVIEW_CHARS`` 的
+        注释）。预览同时进日志与会话记录，事后排障不必再去猜。
+
+        Args:
+            value: 已经过 ``_coerce_params``、但不是 dict 的参数值。
+
+        Returns:
+            形如 ``str(len=25186, '{"path": … { das')`` 或 ``list`` 的短描述。
+        """
+        if not isinstance(value, str):
+            return type(value).__name__
+        limit = _ARGUMENT_PREVIEW_CHARS
+        preview = value if len(value) <= limit * 2 else f"{value[:limit]}…{value[-limit:]}"
+        return f"{type(value).__name__}(len={len(value)}, {preview!r})"
+
     def prepare_call(
         self,
         name: str,
@@ -133,8 +161,12 @@ class ToolRegistry:
             return tool, params, (
                 ToolResult.error(
                     f"Error: Tool '{name}' parameters must be a JSON object, got "
-                    f"{type(params).__name__}. Use named parameters like "
-                    'tool_name(param1="value1", param2="value2") matching the tool schema.'
+                    f"{self._describe_argument_shape(params)}. Use named parameters like "
+                    'tool_name(param1="value1", param2="value2") matching the tool schema. '
+                    "If you were writing a large file, the arguments were most likely cut off "
+                    "by the output token limit: write it in chunks instead — first call "
+                    'write_file(path, content="<first part>"), then append the rest with '
+                    'write_file(path, content="<next part>", append=true).'
                 )
             )
 

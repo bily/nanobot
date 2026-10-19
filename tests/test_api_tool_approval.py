@@ -263,6 +263,45 @@ async def test_deny_verdict_carries_reason(aiohttp_client) -> None:
 
 
 @pytest.mark.asyncio
+async def test_always_verdict_is_accepted_and_records_an_exemption(
+    aiohttp_client,
+) -> None:
+    """``always`` 要走完与 ``allow`` 同一条路，外加落一格会话豁免。
+
+    两个失败形态都不会报错，只会让功能看起来「点了没生效」：
+    - 端点把 ``always`` 判成非法 → 400，UI 上按钮点得动但请求被拒；
+    - 端点认了却不同时落豁免 → 引擎下一轮又问一遍同一个工具。
+    """
+    request = ApprovalRequest(
+        request_id="appr-always1",
+        tool="exec",
+        args={"command": "ls"},
+        session_key="api:always-session",
+    )
+    future = PENDING_APPROVALS.register(request)
+
+    agent = _make_agent(AsyncMock(return_value="ok"))
+    app = create_app(agent, model_name="m", api_key=API_KEY)
+    client = await aiohttp_client(app)
+
+    resp = await client.post(
+        "/v1/tool-approvals/appr-always1",
+        headers=AUTH_HEADERS,
+        json={"decision": "always"},
+    )
+    assert resp.status == 200
+    payload = await resp.json()
+    assert payload["decision"] == "always"
+
+    decision = await future
+    assert decision.allowed is True
+    assert PENDING_APPROVALS.always_allowed("api:always-session") == frozenset({"exec"})
+
+    # 清理：豁免挂在进程级单例上，留着会污染其他用例
+    PENDING_APPROVALS.cancel_session("api:always-session")
+
+
+@pytest.mark.asyncio
 async def test_unknown_request_id_is_404(aiohttp_client) -> None:
     agent = _make_agent(AsyncMock(return_value="ok"))
     app = create_app(agent, model_name="m", api_key=API_KEY)

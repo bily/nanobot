@@ -294,6 +294,19 @@ def make_provider(
             primary_context_window_tokens=resolved.context_window_tokens,
         )
 
+    # [LOCAL PATCH] FR-11.7：让所有 runtime 的 provider 默认携带 LLM 用量观察者，
+    # 覆盖 serve / gateway / preset / override 全路径。否则只有 gateway 静态快照里
+    # 那个 provider 被绑过观察者（gateway_runtime._observe_provider），交互链路
+    # （含流式 / user）按需构造的新鲜 provider 永远不绑 —— 交互流量与 ttft_ms 从不
+    # 落库（B4-02 真机发现）。绑在构造出口与 _observe_provider 等价且更彻底；
+    # set_llm_call_observer 幂等，不会重复落库。
+    try:
+        from nanobot.llm_usage import record_llm_call
+
+        provider.set_llm_call_observer(record_llm_call)
+    except Exception:  # pragma: no cover - 用量落库失败不应影响对话
+        pass
+
     return provider
 
 

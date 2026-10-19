@@ -93,6 +93,14 @@ class SpawnTool(Tool):
         origin_channel = request_ctx.channel
         origin_chat_id = request_ctx.chat_id
         session_key = request_ctx.session_key or f"{origin_channel}:{origin_chat_id}"
+        # [LOCAL PATCH] FR-2.5：/v1（OpenAI 兼容 API）是一次性请求-响应链路，没有
+        # 后台回注消费者——serve 拓扑下 `spawn(wait=false)` 的结果经 bus 广播，但 API
+        # 调用方早就在 chat/completions 返回了，子代理产出随之丢失。这条链路必须走
+        # `run_inline` 把结果直接回注为工具结果，否则子代理产出永远进不了当前回答
+        # （即计划的「spawn(wait=false) 结果必丢」）。交互式渠道（websocket / discord
+        # / feishu …）仍走后台 spawn，由 loop 把 subagent_result 作为后续轮次回注，故不强制。
+        if origin_channel == "api":
+            wait = True
         method = self._manager.run_inline if wait else self._manager.spawn
         return await method(
             task=task,

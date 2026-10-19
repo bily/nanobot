@@ -14,6 +14,14 @@ from nanobot.config.loader import merge_missing_defaults
 DEFAULT_INSTANCE_ID = "default"
 _INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
+#: 段级策略键：只属于 feishu 段本身，不是实例连接配置。
+#:
+#: 为什么单独列出来：`workspace_access.channel_tool_approval_modes` 按**段级**
+#: 读取 `tool_approval`（B3-03 IM 审批），而下面的 `inherited` 机制会把段级键
+#: 合进每个实例——一旦经 canonical 形态回写，段级键被丢弃、实例里多出一份
+#: 副本，读取端随即失效（审批静默变回 auto）。故：不下放、不丢弃，统一保存在段级。
+SECTION_ONLY_KEYS = ("tool_approval",)
+
 
 def validate_instance_id(value: str) -> str:
     """Return a normalized instance id or raise ValueError."""
@@ -101,7 +109,11 @@ def _feishu_instance_inputs(
 
     instances = section_data.get("instances")
     if isinstance(instances, list):
-        inherited = {key: value for key, value in section_data.items() if key != "instances"}
+        inherited = {
+            key: value
+            for key, value in section_data.items()
+            if key != "instances" and key not in SECTION_ONLY_KEYS
+        }
         return list(cast(list[Any], instances)), inherited
     return ([section_data] if section_data else [_base_feishu_instance_config(defaults)]), None
 
@@ -170,6 +182,12 @@ def feishu_instance_specs(
 
 def canonical_feishu_section(section: Any, defaults: dict[str, Any]) -> dict[str, Any]:
     """Return a canonical section, rejecting input that cannot be preserved safely."""
+    if hasattr(section, "model_dump"):
+        section = section.model_dump(mode="json", by_alias=True)
+    # 段级策略键在进 canonical 形态前先取走：它们不属于任何实例，也不许被丢弃。
+    section_approval = (
+        section.get("tool_approval") if isinstance(section, dict) else None
+    )
     raw_specs, inherited = _feishu_instance_inputs(section, defaults)
     instances: list[dict[str, Any]] = []
     instance_ids: set[str] = set()
@@ -192,9 +210,17 @@ def canonical_feishu_section(section: Any, defaults: dict[str, Any]) -> dict[str
         if instance_id in instance_ids:
             raise ValueError(f"duplicate Feishu instance id '{instance_id}'")
         instance_ids.add(instance_id)
+        # 兼容历史上被 inherited 泄漏进实例的段级策略键：段级缺失时从实例里
+        # 回收（首个非空生效），随后一律从实例上剥掉——统一后只存段级一份。
+        instance_approval = config.pop("tool_approval", None)
+        if section_approval is None and isinstance(instance_approval, str) and instance_approval:
+            section_approval = instance_approval
         instances.append(config)
 
-    return {"instances": instances}
+    canonical: dict[str, Any] = {"instances": instances}
+    if section_approval is not None:
+        canonical["tool_approval"] = section_approval
+    return canonical
 
 
 def upsert_feishu_instance(

@@ -478,3 +478,90 @@ class TestWorkspaceRestriction:
         )
         assert "Successfully edited" in result
         assert target.read_text(encoding="utf-8") == "after\n"
+
+
+# ---------------------------------------------------------------------------
+# write_file 分片追加
+#
+# 2026-09-29 事故：模型把整份单文件游戏塞进一次 `write_file`，参数在 25186 字符处被
+# 输出上限截断成半截 JSON，工具只收到一个无法解析的字符串，文件从未创建。分片追加是
+# 大文件的唯一正路，因此它的行为必须与「一次写入」逐字节等价，超限必须显式失败。
+# ---------------------------------------------------------------------------
+
+
+class TestWriteFileChunkedWrites:
+    """`append=True` 的语义、与一次写入的等价性、以及单次体积上限。"""
+
+    @pytest.mark.asyncio
+    async def test_append_continues_the_same_file(self, tmp_path):
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        tool = WriteFileTool(workspace=workspace, allowed_dir=workspace)
+        target = workspace / "game.html"
+
+        first = await tool.execute(path=str(target), content="<html>\n")
+        second = await tool.execute(path=str(target), content="<script>\n", append=True)
+
+        assert "Successfully wrote" in first
+        assert "Successfully appended" in second
+        assert "bytes" in second  # 追写后回报文件当前体积，便于模型判断是否写全
+        assert target.read_text(encoding="utf-8") == "<html>\n<script>\n"
+
+    @pytest.mark.asyncio
+    async def test_chunked_write_matches_single_write_byte_for_byte(self, tmp_path):
+        """分片拼接 == 一次写入。换行翻译必须同口径，否则同一个文件两种写法字节不同。"""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        tool = WriteFileTool(workspace=workspace, allowed_dir=workspace)
+        chunks = ["line1\nline2\n", "line3\n", "\nline4"]
+
+        chunked = workspace / "chunked.txt"
+        await tool.execute(path=str(chunked), content=chunks[0])
+        for chunk in chunks[1:]:
+            await tool.execute(path=str(chunked), content=chunk, append=True)
+
+        single = workspace / "single.txt"
+        await tool.execute(path=str(single), content="".join(chunks))
+
+        assert chunked.read_bytes() == single.read_bytes()
+
+    @pytest.mark.asyncio
+    async def test_append_creates_truncated_path_file_when_missing(self, tmp_path):
+        """`append=True` 而文件不存在时按新建处理（模型不必先判断文件在不在）。"""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        tool = WriteFileTool(workspace=workspace, allowed_dir=workspace)
+        target = workspace / "nested" / "new.txt"
+
+        result = await tool.execute(path=str(target), content="hello", append=True)
+
+        assert "Successfully appended" in result
+        assert target.read_text(encoding="utf-8") == "hello"
+
+    @pytest.mark.asyncio
+    async def test_oversized_content_is_rejected_with_chunking_advice(self, tmp_path):
+        """超限必须显式失败并给出出路，而不是把半截 JSON 交给工具。"""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        tool = WriteFileTool(workspace=workspace, allowed_dir=workspace)
+        target = workspace / "huge.txt"
+
+        result = await tool.execute(path=str(target), content="x" * 48_001)
+
+        assert "Error" in result
+        assert "48000" in result
+        assert "append=true" in result
+        assert not target.exists()  # 失败不留半个文件
+
+    @pytest.mark.asyncio
+    async def test_limit_boundary_is_inclusive(self, tmp_path):
+        """正好 48000 字符仍放行：上限是「不超过」，不是「小于」。"""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        tool = WriteFileTool(workspace=workspace, allowed_dir=workspace)
+        target = workspace / "boundary.txt"
+
+        result = await tool.execute(path=str(target), content="x" * 48_000)
+
+        assert "Successfully wrote" in result
+        assert target.stat().st_size == 48_000

@@ -521,3 +521,24 @@ class SkillsLoader:
             Metadata dict or None.
         """
         return parse_skill_metadata(self.load_skill(name) or "")
+
+    def declared_tools(self, names: list[str]) -> list[tuple[str, object]]:
+        """[LOCAL PATCH] FR-3.12：技能 frontmatter 里**原始**的 `tools:` 值。
+
+        只返回**确实写了** `tools:` 的技能 —— 「没声明」与「声明为空集」是两件事：
+        前者不施加约束，后者全部拒绝。把两者混起来会让一个 YAML 手滑变成
+        「什么都没限制」。
+
+        刻意返回**未收敛**的原值，收敛交给 `agent/hooks/plugin_tools.parse_declared_tools`：
+        那份解析要同时服务插件清单，写两份必然漂移，而漂移的那一边表现为
+        「声明了却不生效」（只认列表的那份会把手写单值读成空）。这里不引它，
+        是为了避免 `agent.skills` 反向依赖 `agent.hooks` —— `plugins.py` 与
+        `tools/filesystem.py` 用的是同一套懒引入手法规避同类环。
+        """
+        declared: list[tuple[str, object]] = []
+        for name in names:
+            metadata = self.get_skill_metadata(name)
+            if metadata is None or "tools" not in metadata:
+                continue
+            declared.append((name, metadata["tools"]))
+        return declared

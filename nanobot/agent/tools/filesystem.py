@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pydantic import Field
+
 from nanobot.agent.tools.base import Tool, ToolResult, tool_parameters
 from nanobot.agent.tools.context import ToolContext
 from nanobot.agent.tools.file_state import FileStates, _hash_file, current_file_states
@@ -20,6 +22,7 @@ from nanobot.agent.tools.schema import (
     tool_parameters_schema,
 )
 from nanobot.config_base import Base
+from nanobot.security.path_rules import PathRule, normalize_path_rules
 from nanobot.security.trash import (
     DEFAULT_BULK_THRESHOLD,
     TRASH_UNAVAILABLE_NOTE,
@@ -43,6 +46,13 @@ class FileToolsConfig(Base):
     #: 一律拒绝写操作，而不是退化成「哪里都能写」。默认 False 保持引擎上游
     #: 语义不变；nanowork 客户端显式打开。
     default_deny_write: bool = False
+    #: [LOCAL PATCH] nanowork FR-8.13「路径级权限规则」。
+    #: 形如 `[{"path": "...", "action": {"read": "deny", "write": "allow"}}]`；
+    #: 三种动作（读 / 写 / 删）**各自独立**授权，见 `security/path_rules.py`。
+    #: 空 list = 没有规则，行为与本条落地前**逐字相同**（验收③）。
+    #: ⚠️ 这里是**未归一化**的原始形状；归一化（`normalize_path_rules`）在
+    #: `FilesystemTools.create()` 里做一次，不要在读取处重复做。
+    path_rules: list[Any] = Field(default_factory=list)
     #: [LOCAL PATCH] nanowork FR-8.3「删除留痕」。
     #: 每次删除追加一行 JSON 到该文件（对齐 WorkBuddy 的
     #: `safe-delete-report.ndjson`）。留空表示由 `create()` 落到
@@ -83,6 +93,10 @@ class _FsTool(Tool):
         safe_delete_report_path: str = "",
         safe_delete_bulk_threshold: int = DEFAULT_BULK_THRESHOLD,
         user_plugins_dir: Path | None = None,
+        # [LOCAL PATCH] FR-8.13：**已归一化**的路径规则（`create()` 里收敛过一次）。
+        # 这里刻意不接原始配置：每次工具调用都重新解析一遍坏条目，会把
+        # 「一条规则写错」放大成「每次调用都告警一次」，日志直接淹掉。
+        path_rules: tuple[PathRule, ...] = (),
     ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
@@ -91,6 +105,8 @@ class _FsTool(Tool):
         self._user_plugins_dir = user_plugins_dir
         # [LOCAL PATCH] nanowork FR-8.4：写操作的默认策略（无白名单即拒绝）。
         self._default_deny_write = bool(default_deny_write)
+        # [LOCAL PATCH] nanowork FR-8.13：路径级规则（读 / 写 / 删各自授权）。
+        self._path_rules: tuple[PathRule, ...] = tuple(path_rules or ())
         # [LOCAL PATCH] nanowork FR-8.3：删除留痕与批量守卫。
         self._safe_delete_report_path = safe_delete_report_path
         self._safe_delete_bulk_threshold = int(safe_delete_bulk_threshold)
@@ -148,6 +164,10 @@ class _FsTool(Tool):
             restrict_to_workspace=ctx.config.restrict_to_workspace,
             sandbox_restricts_workspace=sandbox_restricts,
             default_deny_write=getattr(ctx.config.file, "default_deny_write", False),
+            # [LOCAL PATCH] FR-8.13：原始配置 → 规则元组，**只在这里做一次**。
+            # 坏条目在收敛时丢弃并告警，之后每次工具调用拿到的都是干净元组；
+            # 反过来在读取处逐次归一化，会把「一条规则写错」放大成「每次调用告警一次」。
+            path_rules=normalize_path_rules(getattr(ctx.config.file, "path_rules", None)),
             safe_delete_report_path=report_path,
             safe_delete_bulk_threshold=int(
                 getattr(
@@ -187,6 +207,9 @@ class _FsTool(Tool):
         include_media_dir: bool,
         extra_files_require_allowed_root: bool = False,
         write: bool = False,
+        # [LOCAL PATCH] FR-8.13：本次解析按哪个动作裁决。删除复用写解析路径，
+        # 但**不能**因此被当成 write —— 否则 `delete=deny` 永远不生效。
+        kind: str = "read",
     ) -> Path:
         access = current_tool_workspace(
             self._workspace,
@@ -205,6 +228,8 @@ class _FsTool(Tool):
             include_media_dir=include_media_dir,
             write=write,
             deny_write_by_default=self._default_deny_write,
+            rules=self._path_rules,
+            kind=kind,
         )
 
     def _resolve_read(self, path: str) -> Path:
@@ -244,15 +269,19 @@ class _FsTool(Tool):
             self._extra_read_allowed_files,
             include_media_dir=True,
             extra_files_require_allowed_root=True,
+            kind="read",
         )
 
-    def _resolve_write(self, path: str) -> Path:
+    def _resolve_write(self, path: str, *, kind: str = "write") -> Path:
+        # [LOCAL PATCH] FR-8.13：`kind` 可由删除入口覆盖成 `delete`
+        # （删除复用写解析路径，但动作语义是删除）。
         return self._resolve_with_extra(
             path,
             self._extra_write_allowed_dirs,
             self._extra_write_allowed_files,
             include_media_dir=False,
             write=True,
+            kind=kind,
         )
 
     def _resolve(self, path: str) -> Path:
@@ -629,10 +658,31 @@ class ReadFileTool(_FsTool):
 # ---------------------------------------------------------------------------
 
 
+# 单次 write_file 的 content 字符上限。
+#
+# 这不是「文件能有多大」的限制，而是「一个工具调用能带多大参数」的兜底：参数会以
+# JSON 字符串形式占用模型的输出额度，超长必然被输出上限从中间截断，而截断后的 JSON
+# 解析不出来，工具只会收到一个无法执行的字符串（2026-09-29 事故：25186 字符的
+# write_file 参数停在 JS 函数体中间，引擎报 "must be a JSON object, got str"）。
+# 与其让调用在传输层静默烂掉，不如在这里给出可操作的错误，让模型改用 append 分片。
+_MAX_WRITE_CHARS = 48_000
+
+
 @tool_parameters(
     tool_parameters_schema(
         path=StringSchema("The file path to write to"),
-        content=StringSchema("The content to write"),
+        content=StringSchema(
+            "The content to write. Keep a single call under ~48000 characters; "
+            "write larger files in chunks (see the append parameter)."
+        ),
+        append=BooleanSchema(
+            description=(
+                "Append to the file instead of replacing it (default false). Use this to "
+                "write a large file in chunks: first call without append, then append=true "
+                "for each following chunk."
+            ),
+            default=False,
+        ),
         required=["path", "content"],
     )
 )
@@ -650,19 +700,52 @@ class WriteFileTool(_FsTool):
             "Create a new file or intentionally replace an entire file with "
             "the provided content. Overwrites existing files and creates parent "
             "directories as needed. For code changes or partial edits, prefer "
-            "apply_patch; use edit_file only for small exact replacements."
+            "apply_patch; use edit_file only for small exact replacements. "
+            "A single call must stay under ~48000 characters of content — the call "
+            "itself is cut off by the output token limit beyond that. To write a larger "
+            "file, send it in chunks: call once without append, then call again with "
+            "append=true for each remaining chunk (append also creates the file when it "
+            "does not exist yet)."
         )
 
-    async def execute(self, path: str | None = None, content: str | None = None, **kwargs: Any) -> str:
+    async def execute(
+        self,
+        path: str | None = None,
+        content: str | None = None,
+        append: bool = False,
+        **kwargs: Any,
+    ) -> str:
         try:
             if not path:
                 raise ValueError("Unknown path")
             if content is None:
                 raise ValueError("Unknown content")
+            if len(content) > _MAX_WRITE_CHARS:
+                return ToolResult.error(
+                    f"Error: content is {len(content)} characters, over the "
+                    f"{_MAX_WRITE_CHARS}-character limit for one write_file call. "
+                    "A payload this large is truncated by the output token limit before "
+                    "the tool can read it. Write the file in chunks instead: call "
+                    "write_file(path, content=\"<first part>\"), then append each remaining "
+                    "part with write_file(path, content=\"<next part>\", append=true)."
+                )
             fp = self._resolve_write(path)
             fp.parent.mkdir(parents=True, exist_ok=True)
-            fp.write_text(content, encoding="utf-8")
+            if append:
+                # 换行处理必须与覆盖写（`write_text`，newline=None）一致：默认的换行翻译
+                # 是逐字符映射，因此「分片追加」与「一次写入」产出**逐字节相同**的文件。
+                # 这里若改成 newline="" 保留原样，Windows 上分片写会得到 LF 而一次写得
+                # 到 CRLF，同一个文件两种写法产出不同字节——分片就会变成有副作用的操作。
+                with fp.open("a", encoding="utf-8") as fh:
+                    fh.write(content)
+            else:
+                fp.write_text(content, encoding="utf-8")
             self._file_states.record_write(fp)
+            if append:
+                return (
+                    f"Successfully appended {len(content)} characters to {fp} "
+                    f"(file is now {fp.stat().st_size} bytes)"
+                )
             return f"Successfully wrote {len(content)} characters to {fp}"
         except PermissionError as e:
             return ToolResult.error(f"Error: {e}")
@@ -1325,7 +1408,9 @@ class SafeDeleteTool(_FsTool):
         try:
             # 删除是写类操作：复用写解析路径，让 FR-8.4 的默认拒绝写入与
             # 凭据 no_access 守卫同样覆盖删除（否则删除就是写策略的旁路）。
-            target = self._resolve_write(path)
+            # [LOCAL PATCH] FR-8.13：但动作按 **delete** 裁决 —— 否则
+            # `delete=deny` 与 `write=allow` 同时存在时，删除会被判成「写」而放行。
+            target = self._resolve_write(path, kind="delete")
         except PermissionError as e:
             self._report(operation="refused", path=path, ok=False, detail=str(e))
             return ToolResult.error(f"Error: {e}")

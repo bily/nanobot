@@ -315,6 +315,82 @@ async def test_spawn_tool_waits_for_inline_result():
 
 
 @pytest.mark.asyncio
+async def test_spawn_tool_forces_inline_for_api_channel():
+    """FR-2.5：/v1（OpenAI 兼容 API）是一次性请求-响应链路，没有后台回注消费者。
+
+    模型即便显式传 ``wait=False``（后台 spawn），在这条链路上结果也会随
+    chat/completions 返回而丢失。因此 channel="api" 必须强制走 ``run_inline``，
+    让子代理产出直接回注为工具结果。交互式渠道不在此列。
+    """
+    from nanobot.agent.tools.context import RequestContext, request_context
+    from nanobot.agent.tools.spawn import SpawnTool
+
+    class Manager:
+        max_concurrent_subagents = 1
+
+        def __init__(self):
+            self.inline = AsyncMock(return_value="api inline result")
+            self.spawn = AsyncMock(return_value="started")
+
+        def get_running_count(self):
+            return 0
+
+        async def run_inline(self, **kwargs):
+            return await self.inline(**kwargs)
+
+    manager = Manager()
+    tool = SpawnTool(manager)
+    runtime = _runtime(MagicMock())
+    # 模型显式要后台执行，但走的是 /v1 API 链路
+    with request_context(RequestContext(
+        channel="api",
+        chat_id="c1",
+        session_key="api:c1",
+        runtime=runtime,
+    )):
+        result = await tool.execute(task="review this via api", wait=False)
+
+    assert result == "api inline result"
+    manager.inline.assert_awaited_once()
+    manager.spawn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_spawn_tool_respects_background_for_interactive_channel():
+    """对照：交互式渠道（websocket）即便不传 wait，也仍走后台 spawn（允许后台）。"""
+    from nanobot.agent.tools.context import RequestContext, request_context
+    from nanobot.agent.tools.spawn import SpawnTool
+
+    class Manager:
+        max_concurrent_subagents = 1
+
+        def __init__(self):
+            self.inline = AsyncMock(return_value="inline result")
+            self.spawn = AsyncMock(return_value="started")
+
+        def get_running_count(self):
+            return 0
+
+        async def run_inline(self, **kwargs):
+            return await self.inline(**kwargs)
+
+    manager = Manager()
+    tool = SpawnTool(manager)
+    runtime = _runtime(MagicMock())
+    with request_context(RequestContext(
+        channel="websocket",
+        chat_id="c1",
+        session_key="websocket:c1",
+        runtime=runtime,
+    )):
+        result = await tool.execute(task="do it in background", wait=False)
+
+    assert result == "started"
+    manager.spawn.assert_awaited_once()
+    manager.inline.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_inline_spawn_waits_for_concurrency_capacity(tmp_path):
     from nanobot.agent.subagent import SubagentManager
     from nanobot.agent.tools.context import RequestContext, request_context

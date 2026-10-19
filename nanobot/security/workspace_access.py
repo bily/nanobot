@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -158,6 +158,13 @@ class WorkspaceScopeResolver:
     # [LOCAL PATCH] 允许携带会话级 workspace scope 的渠道集合：
     # websocket（WebUI 原有）+ api（本客户端按会话选择工作空间/权限）。
     scoped_channels: frozenset[str] = frozenset({"websocket", "api"})
+    #: [LOCAL PATCH] FR-6.5：未纳入会话作用域的渠道（IM）各自的审批模式。
+    #:
+    #: 默认空 = 全部 ``auto``，与引入审批桥之前的行为一致。只影响 ``for_turn``
+    #: 走「默认作用域」的那条路——api / websocket 仍以请求下发为准。
+    default_tool_approval_by_channel: Mapping[str, ToolApprovalMode] = field(
+        default_factory=dict
+    )
 
     @property
     def sandbox_status(self) -> WorkspaceSandboxStatus:
@@ -167,6 +174,18 @@ class WorkspaceScopeResolver:
         return default_workspace_scope(
             self.default_workspace,
             self.default_restrict_to_workspace,
+        )
+
+    def default_for(self, channel: str | None) -> WorkspaceScope:
+        """[LOCAL PATCH] 未纳入作用域的渠道：默认作用域 + 该渠道的审批模式。"""
+        mode: ToolApprovalMode = "auto"
+        if channel:
+            mode = self.default_tool_approval_by_channel.get(channel, "auto")
+        return default_workspace_scope(
+            self.default_workspace,
+            self.default_restrict_to_workspace,
+            source_channel=channel,
+            tool_approval=mode,
         )
 
     def for_message(
@@ -188,7 +207,7 @@ class WorkspaceScopeResolver:
         session_metadata: Any,
     ) -> WorkspaceScope:
         if channel not in self.scoped_channels:
-            return self.default()
+            return self.default_for(channel)
         return resolve_effective_workspace_scope(
             message_metadata=message_metadata,
             session_metadata=session_metadata,
@@ -267,6 +286,50 @@ def _normalize_tool_approval(raw: str) -> ToolApprovalMode:
             f"tool_approval must be one of {sorted(_TOOL_APPROVAL_MODES)}, got {raw!r}"
         )
     return "auto"
+
+
+def channel_tool_approval_modes(channels_config: Any) -> dict[str, ToolApprovalMode]:
+    """[LOCAL PATCH] FR-6.5：从渠道配置里读 per-channel ``tool_approval``。
+
+    写法：``"channels": {"feishu": {"tool_approval": "ask", ...}}``。
+
+    为什么需要它：``api`` / ``websocket`` 的审批模式由**请求**下发（客户端有
+    一键开关）；IM 渠道没有这个 UI，而引擎默认是 ``auto``——不补一个配置面，
+    IM 审批桥就永远等不到 ``approval_request``（等于死代码）。
+
+    只对**未纳入会话作用域**的渠道生效（见 ``scoped_channels``），因此不会影响
+    桌面的「默认权限 / 逐条批准」选择。未知取值**忽略**而不是抛错：这是长期
+    存在的配置文件里的一个可选键，拼错不该让整个网关起不来。
+
+    段级是唯一权威位置。feishu 这类多实例段历史上曾把 ``tool_approval`` 泄漏进
+    ``instances[]``（段级键被 inherited 机制下放后又回写盘），这里兜底回收：
+    段级缺失时取实例上的值（首个有效生效），避免存量配置静默变回 auto。
+    """
+    if channels_config is None:
+        return {}
+    # Pydantic v2：未声明的渠道名落在 ``model_extra``；也接受普通 dict 便于单测。
+    raw_sections: Any = getattr(channels_config, "model_extra", None)
+    if not isinstance(raw_sections, dict):
+        raw_sections = channels_config if isinstance(channels_config, dict) else {}
+    out: dict[str, ToolApprovalMode] = {}
+    for name, section in raw_sections.items():
+        if not isinstance(section, dict):
+            continue
+        value = section.get("tool_approval")
+        if not (isinstance(value, str) and value.strip().lower() in _TOOL_APPROVAL_MODES):
+            # 兜底：段级没有有效值时，从 instances[] 里回收（兼容存量污染形态）
+            instances = section.get("instances")
+            if isinstance(instances, list):
+                for inst in instances:
+                    if not isinstance(inst, dict):
+                        continue
+                    candidate = inst.get("tool_approval")
+                    if isinstance(candidate, str) and candidate.strip().lower() in _TOOL_APPROVAL_MODES:
+                        value = candidate
+                        break
+        if isinstance(value, str) and value.strip().lower() in _TOOL_APPROVAL_MODES:
+            out[str(name)] = cast(ToolApprovalMode, value.strip().lower())
+    return out
 
 
 def _normalize_session_mode(raw: str) -> SessionMode:
@@ -385,11 +448,13 @@ def default_workspace_scope(
     restrict_to_workspace: bool,
     *,
     source_channel: str | None = None,
+    tool_approval: str = "auto",
 ) -> WorkspaceScope:
     return build_workspace_scope(
         workspace,
         default_access_mode(restrict_to_workspace),
         source_channel=source_channel,
+        tool_approval=tool_approval,
     )
 
 

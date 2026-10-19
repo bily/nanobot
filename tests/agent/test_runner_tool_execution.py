@@ -145,11 +145,26 @@ def _load_entry_point_plugin(tool_cls: type[Tool], tmp_path) -> ToolRegistry:
     return registry
 
 
-def _tool_message(result, tool_call_id: str) -> dict:
+def _tool_messages(result, tool_call_id: str) -> list[dict]:
+    """匹配某次调用的全部工具结果消息。
+
+    返回列表而不是单个：调用可能被 runner 丢弃而根本没执行，此时「一条都没有」
+    就是正确结果，不该在取 [0] 时炸掉。
+    """
     return [
         msg for msg in result.messages
         if msg.get("role") == "tool" and msg.get("tool_call_id") == tool_call_id
-    ][0]
+    ]
+
+
+def _history_tool_calls(result) -> list[dict]:
+    """历史里残留的 tool_calls：畸形调用一旦落进历史就会被逐轮重放。"""
+    return [
+        tc
+        for msg in result.messages
+        if msg.get("role") == "assistant"
+        for tc in (msg.get("tool_calls") or [])
+    ]
 
 
 @pytest.mark.asyncio
@@ -349,7 +364,14 @@ async def test_runner_rejects_near_miss_tool_name_without_executing():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("arguments", ['{path:"notes.txt"}', "null"])
-async def test_runner_rejects_openai_compat_invalid_arguments_without_executing(arguments):
+async def test_runner_drops_openai_compat_invalid_arguments_without_executing(arguments):
+    """参数不是 JSON 对象的调用在**执行前**被 runner 丢弃，且不落进历史。
+
+    旧行为是放它走到 registry，换回一条「must be a JSON object」的错误结果；现在改为一等
+    malformed 情形（`ToolCallRequest.has_usable_arguments`）在源头丢弃。理由：这类参数几乎
+    都是被输出上限截断的半截 JSON，留在历史里会被 `tool_arguments_object_for_replay`
+    用 json_repair 修成假参数、之后每轮重放（2026-09-29 事故）。
+    """
     with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
         parsed = OpenAICompatProvider()._parse({
             "choices": [{
@@ -368,18 +390,21 @@ async def test_runner_rejects_openai_compat_invalid_arguments_without_executing(
             "usage": {},
         })
 
+    arguments_seen = parsed.tool_calls[0].arguments
     result, shared_events = await _run_optional_tool_response(parsed)
 
     assert result.final_content == "done"
-    assert parsed.tool_calls[0].arguments == arguments
+    # provider 层原样保留畸形参数（不猜、不修），丢弃发生在 runner 执行前
+    assert arguments_seen == arguments
+    assert parsed.tool_calls == []
     assert result.tools_used == []
     assert shared_events == []
-    tool_message = _tool_message(result, "call_1")
-    assert "parameters must be a JSON object" in tool_message["content"]
+    assert _tool_messages(result, "call_1") == []
+    assert _history_tool_calls(result) == []
 
 
 @pytest.mark.asyncio
-async def test_runner_rejects_openai_responses_malformed_arguments_without_executing():
+async def test_runner_drops_openai_responses_malformed_arguments_without_executing():
     parsed = parse_response_output({
         "output": [{
             "type": "function_call",
@@ -392,18 +417,20 @@ async def test_runner_rejects_openai_responses_malformed_arguments_without_execu
         "usage": {},
     })
 
+    arguments_seen = parsed.tool_calls[0].arguments
     result, shared_events = await _run_optional_tool_response(parsed)
 
     assert result.final_content == "done"
-    assert parsed.tool_calls[0].arguments == "{bad"
+    assert arguments_seen == "{bad"
+    assert parsed.tool_calls == []
     assert result.tools_used == []
     assert shared_events == []
-    tool_message = _tool_message(result, "call_1|fc_1")
-    assert "parameters must be a JSON object" in tool_message["content"]
+    assert _tool_messages(result, "call_1|fc_1") == []
+    assert _history_tool_calls(result) == []
 
 
 @pytest.mark.asyncio
-async def test_runner_rejects_openai_responses_array_arguments_without_executing():
+async def test_runner_drops_openai_responses_array_arguments_without_executing():
     parsed = parse_response_output({
         "output": [{
             "type": "function_call",
@@ -416,14 +443,16 @@ async def test_runner_rejects_openai_responses_array_arguments_without_executing
         "usage": {},
     })
 
+    arguments_seen = parsed.tool_calls[0].arguments
     result, shared_events = await _run_optional_tool_response(parsed)
 
     assert result.final_content == "done"
-    assert parsed.tool_calls[0].arguments == []
+    assert arguments_seen == []
+    assert parsed.tool_calls == []
     assert result.tools_used == []
     assert shared_events == []
-    tool_message = _tool_message(result, "call_1|fc_1")
-    assert "parameters must be a JSON object" in tool_message["content"]
+    assert _tool_messages(result, "call_1|fc_1") == []
+    assert _history_tool_calls(result) == []
 
 
 @pytest.mark.asyncio

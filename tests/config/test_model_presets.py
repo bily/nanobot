@@ -471,3 +471,209 @@ def test_transcription_only_provider_is_not_chat_fallback() -> None:
     })
 
     assert config.get_provider_name() is None
+
+
+def test_model_preset_capability_flags_round_trip() -> None:
+    """[LOCAL PATCH] 客户端「高级配置」的三项能力声明必须能落盘并回读。
+
+    这三项引擎目前不消费（工具定义始终下发），但它们**必须是已声明字段**：
+    `Base` 未开 `extra="allow"`，未声明的键会被 pydantic 静默丢弃 —— 于是
+    「勾选了 → 保存了 → 再打开又全没了」，且没有任何报错。这条用例就是拦它的。
+    """
+    config = Config.model_validate({
+        "model_presets": {
+            "vision-gw": {
+                "model": "gw-omni",
+                "provider": "my-gateway",
+                "supportsTools": False,
+                "supportsVision": True,
+                "customProtocol": True,
+            }
+        }
+    })
+
+    preset = config.model_presets["vision-gw"]
+    assert preset.supports_tools is False
+    assert preset.supports_vision is True
+    assert preset.custom_protocol is True
+
+    # 落盘形态是 camelCase（`alias_generator=to_camel`），回读键名要与客户端写入的一致
+    dumped = config.model_dump(mode="json", by_alias=True)["modelPresets"]["vision-gw"]
+    assert dumped["supportsTools"] is False
+    assert dumped["supportsVision"] is True
+    assert dumped["customProtocol"] is True
+    assert Config.model_validate(
+        {"modelPresets": {"vision-gw": dumped}}
+    ).model_presets["vision-gw"].supports_vision is True
+
+
+def test_model_preset_capability_defaults() -> None:
+    """缺省值：工具调用默认开（引擎确实下发工具定义），另两项默认关。"""
+    preset = Config.model_validate({"modelPresets": {"plain": {"model": "x"}}}).model_presets[
+        "plain"
+    ]
+    assert preset.supports_tools is True
+    assert preset.supports_vision is False
+    assert preset.custom_protocol is False
+
+
+def test_model_preset_reasoning_and_pricing_round_trip() -> None:
+    """[LOCAL PATCH] `supportsReasoning` 与 `pricing` 必须能落盘并回读。
+
+    与上面那条能力声明同因：`Base` 未开 `extra="allow"`，未声明的键会被静默丢弃，
+    症状是「填了单价 → 保存了 → 再打开又没了」，而**界面上看不出任何异常**——
+    只是金额又变回「暂不统计」。所以每加一个声明式字段，都要有一条往返用例。
+
+    顺带把「三档单价」的形状钉住：`cacheReadPerMillion` 允许缺省（= 没填，
+    由客户端按输入单价计），而**不是** 0（0 是「缓存免费」，那是另一个方向的错）。
+    """
+    config = Config.model_validate({
+        "modelPresets": {
+            "priced": {
+                "model": "gw-omni",
+                "supportsReasoning": False,
+                "pricing": {
+                    "inputPerMillion": 2.5,
+                    "outputPerMillion": 10,
+                    "cacheReadPerMillion": 0.25,
+                    "currency": "USD",
+                },
+            },
+            "no-price": {"model": "plain"},
+        }
+    })
+
+    priced = config.model_presets["priced"]
+    assert priced.supports_reasoning is False
+    assert priced.pricing is not None
+    assert priced.pricing.input_per_million == 2.5
+    assert priced.pricing.output_per_million == 10
+    assert priced.pricing.cache_read_per_million == 0.25
+    assert priced.pricing.currency == "USD"
+
+    dumped = config.model_dump(mode="json", by_alias=True)["modelPresets"]["priced"]
+    assert dumped["supportsReasoning"] is False
+    assert dumped["pricing"] == {
+        "inputPerMillion": 2.5,
+        "outputPerMillion": 10,
+        "cacheReadPerMillion": 0.25,
+        "currency": "USD",
+    }
+    # 回读一致（客户端写 camelCase、引擎读回来再 dump 还是 camelCase）
+    assert (
+        Config.model_validate({"modelPresets": {"priced": dumped}})
+        .model_presets["priced"]
+        .pricing.input_per_million
+        == 2.5
+    )
+
+    # 没配单价的预设：`pricing` 是 None，不是全零对象 —— 客户端据此判定「不参与金额合计」
+    assert config.model_presets["no-price"].pricing is None
+
+
+def test_model_preset_reasoning_default_is_permissive() -> None:
+    """`supports_reasoning` 默认 **True**（与 `supports_vision` 的方向相反）。
+
+    客户端拿它做硬门禁（不声明就禁用「注入思考强度」）。默认取保守方向的话，
+    所有没勾过的历史预设都会一升级就被禁掉——那是「门禁把所有人都拦下」的经典错法。
+    """
+    preset = Config.model_validate({"modelPresets": {"plain": {"model": "x"}}}).model_presets[
+        "plain"
+    ]
+    assert preset.supports_reasoning is True
+    assert preset.pricing is None
+
+
+def test_model_pricing_rejects_unknown_currency() -> None:
+    """币种取值域是 `Literal`，拼错要**当场报错**而不是静默接受。
+
+    裸 `str` 下 `"RMB"` 会被接受，然后在客户端的按币种分组里多出一行
+    「另一种货币」——那种错误在界面上完全看不出是错的。
+    """
+    import pytest
+
+    with pytest.raises(Exception):
+        Config.model_validate(
+            {"modelPresets": {"x": {"model": "m", "pricing": {"inputPerMillion": 1, "currency": "RMB"}}}}
+        )
+
+
+def test_model_preset_reasoning_and_pricing_round_trip() -> None:
+    """[LOCAL PATCH] `supportsReasoning` 与 `pricing` 必须能落盘并回读。
+
+    与上面那条能力声明同因：`Base` 未开 `extra="allow"`，未声明的键会被静默丢弃，
+    症状是「填了单价 → 保存了 → 再打开又没了」，而**界面上看不出任何异常**——
+    只是金额又变回「暂不统计」。所以每加一个声明式字段，都要有一条往返用例。
+
+    顺带把「三档单价」的形状钉住：`cacheReadPerMillion` 允许缺省（= 没填，
+    由客户端按输入单价计），而**不是** 0（0 是「缓存免费」，那是另一个方向的错）。
+    """
+    config = Config.model_validate({
+        "modelPresets": {
+            "priced": {
+                "model": "gw-omni",
+                "supportsReasoning": False,
+                "pricing": {
+                    "inputPerMillion": 2.5,
+                    "outputPerMillion": 10,
+                    "cacheReadPerMillion": 0.25,
+                    "currency": "USD",
+                },
+            },
+            "no-price": {"model": "plain"},
+        }
+    })
+
+    priced = config.model_presets["priced"]
+    assert priced.supports_reasoning is False
+    assert priced.pricing is not None
+    assert priced.pricing.input_per_million == 2.5
+    assert priced.pricing.output_per_million == 10
+    assert priced.pricing.cache_read_per_million == 0.25
+    assert priced.pricing.currency == "USD"
+
+    dumped = config.model_dump(mode="json", by_alias=True)["modelPresets"]["priced"]
+    assert dumped["supportsReasoning"] is False
+    assert dumped["pricing"] == {
+        "inputPerMillion": 2.5,
+        "outputPerMillion": 10,
+        "cacheReadPerMillion": 0.25,
+        "currency": "USD",
+    }
+    # 回读一致（客户端写 camelCase、引擎读回来再 dump 还是 camelCase）
+    assert (
+        Config.model_validate({"modelPresets": {"priced": dumped}})
+        .model_presets["priced"]
+        .pricing.input_per_million
+        == 2.5
+    )
+
+    # 没配单价的预设：`pricing` 是 None，不是全零对象 —— 客户端据此判定「不参与金额合计」
+    assert config.model_presets["no-price"].pricing is None
+
+
+def test_model_preset_reasoning_default_is_permissive() -> None:
+    """`supports_reasoning` 默认 **True**（与 `supports_vision` 的方向相反）。
+
+    客户端拿它做硬门禁（不声明就禁用「注入思考强度」）。默认取保守方向的话，
+    所有没勾过的历史预设都会一升级就被禁掉——那是「门禁把所有人都拦下」的经典错法。
+    """
+    preset = Config.model_validate({"modelPresets": {"plain": {"model": "x"}}}).model_presets[
+        "plain"
+    ]
+    assert preset.supports_reasoning is True
+    assert preset.pricing is None
+
+
+def test_model_pricing_rejects_unknown_currency() -> None:
+    """币种取值域是 `Literal`，拼错要**当场报错**而不是静默接受。
+
+    裸 `str` 下 `"RMB"` 会被接受，然后在客户端的按币种分组里多出一行
+    「另一种货币」——那种错误在界面上完全看不出是错的。
+    """
+    import pytest
+
+    with pytest.raises(Exception):
+        Config.model_validate(
+            {"modelPresets": {"x": {"model": "m", "pricing": {"inputPerMillion": 1, "currency": "RMB"}}}}
+        )

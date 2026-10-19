@@ -3,11 +3,30 @@
 import base64
 import mimetypes
 import platform
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
 
+from loguru import logger
+
+# [LOCAL PATCH] FR-3.12：技能 / 插件声明的工具白名单（纯策略代数，无 IO）。
+from nanobot.agent.hooks.plugin_tools import (
+    DeclaredToolPolicy,
+    ToolDeclaration,
+    combine_declarations,
+    parse_declared_tools,
+)
 from nanobot.agent.memory import MemoryStore
+
+# [LOCAL PATCH] FR-3.10：插件提示词片段（ChainLoader 的第 ① 级）。
+# ⚠️⚠️ **`nanobot.agent.plugins` 只能函数内局部导入，不能放模块级**：
+# `agent/__init__.py` 重导出本模块，而 `plugins.py` 模块级 import
+# `nanobot.config.loader` —— 模块级一导就把这条链闭成环，于是
+# `config/schema.py` 末尾的 `_resolve_tool_config_refs()` 静默失败，
+# **任何** `Config.model_validate` 都会抛
+# "`Config` is not fully defined; you should define `WebToolsConfig`"。
+# 排查提示写在 schema.py 末尾；本模块正是那条提示里的典型案例。
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.tools import image_generation as image_generation_tools
 from nanobot.agent.tools import mcp as mcp_tools
@@ -31,13 +50,55 @@ from nanobot.session.keys import last_channel_from_metadata
 from nanobot.session.manager import Session
 from nanobot.session.summary import SessionSummary
 from nanobot.utils.helpers import detect_image_mime, load_bundled_template
-from nanobot.utils.prompt_templates import render_template
+from nanobot.utils.prompt_templates import PluginPromptMount, render_template
 
 # [LOCAL PATCH] 身份文件块的标签（design §13.3）。SOUL / IDENTITY / USER 三段共用
 # 一个标签块；AGENTS.md（项目约定）不在其中。客户端侧的注入用的是**同名字符串**，
 # 两端必须保持一致——这个字面量在 `src/lib/constants.ts` 有一份镜像。
 IDENTITY_CONTEXT_TAG_OPEN = "<identity_context>"
 IDENTITY_CONTEXT_TAG_CLOSE = "</identity_context>"
+
+# [LOCAL PATCH] 长期记忆里对「工作目录」的断言一律作废（中英双语）。
+#
+# 为什么需要它：长期记忆是**模型自己写的**，而它会把「当时的工作目录」当成项目事实
+# 固化下来。实测事故（2026-09-19）：2026-09-16 那批会话真的跑在 `D:\test` 上，
+# Dream 于是把 `- Current working directory: D:\test` 写进了
+# `<agent-workspace>/memory/MEMORY.md`。此后无论会话绑到哪个工作空间，这一行都会被
+# 注入——它读起来是**事实陈述**，而 `# Memory` 又排在 `# Current Project` 之后，
+# 于是模型拿它当真相（原话：「根据之前的上下文，当前工作目录是 D:\test」），
+# 用户设置里的 `C:\Users\xinmi\NanoWork` 形同虚设，文件写进了 `D:\test`。
+#
+# 工作目录是**每轮会变的运行时值**：不该、也不能存进长期记忆。这里在注入前就地
+# 作废这类断言——比「删掉用户记忆里那一行」更稳，因为用户随时可能手写回去，
+# Dream 也可能再次总结出来。真正的真相只有一个来源：下面 `# Current Project`。
+_STALE_CWD_LINE = re.compile(
+    r"^[ \t]*(?:[-*•][ \t]*)?"
+    r"(?:current[ \t]+|当前|目前的?)?"
+    r"(?:working[ \t]+directory|工作目录|工作空间目录)"
+    r"[ \t]*(?:(?:是|为)[ \t]*|[=:：][ \t]*)"
+    r".*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# 作废后留下的占位行。不整行删除是为了保住 Markdown 列表结构（删干净会让
+# `## Project Context` 变成空小节，模型反而更容易自己补一个路径上去）。
+_STALE_CWD_REPLACEMENT = (
+    "- (working directory omitted on purpose: it is per-session and provided by the runtime)"
+)
+
+
+def neutralize_stale_working_dir(text: str) -> str:
+    """清掉记忆文本里对工作目录的断言，让运行时值成为唯一来源。
+
+    Args:
+        text: 待注入的长期记忆原文（可能为空）。
+
+    Returns:
+        作废了工作目录断言后的文本；无命中时原样返回。
+    """
+    if not text:
+        return text
+    return _STALE_CWD_LINE.sub(_STALE_CWD_REPLACEMENT, text)
 
 
 def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -115,6 +176,9 @@ class ContextBuilder:
     ):
         self.workspace = workspace
         self.timezone = timezone
+        # FR-3.10：插件提示词片段要在这里取挂载点，故必须留在实例上
+        # （只传给 SkillsLoader 的话，提示词这边就看不到插件目录了）。
+        self.user_plugins_dir = user_plugins_dir
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(
             workspace,
@@ -128,6 +192,66 @@ class ContextBuilder:
             user_plugins_dir=user_plugins_dir,
         )
 
+    def _plugin_prompt_mounts(self, workspace: Path) -> tuple[PluginPromptMount, ...]:
+        """当前工作区已启用插件提供的提示词片段挂载点（FR-3.10）。
+
+        **失败一律降级为空**：插件目录读不了 / 清单坏了，都不该让整轮会话起不来
+        —— 那等于把「可扩展」做成了「可宕机」。取不到就是没有片段，行为回到
+        引入 ChainLoader 之前。
+        """
+        try:
+            # 局部导入：见本文件导入区的 ⚠️⚠️ 说明（模块级会把 config.loader 闭成环）
+            from nanobot.agent.plugins import plugin_prompt_mounts
+
+            return plugin_prompt_mounts(workspace, self.user_plugins_dir)
+        except Exception:
+            logger.warning("failed to resolve Agent Plugin prompt mounts", exc_info=True)
+            return ()
+
+    def declared_tool_policy(self, workspace: Path | None = None) -> DeclaredToolPolicy:
+        """本轮生效的工具声明（FR-3.12）。语义与纪律见 `hooks/plugin_tools.py`。
+
+        两个来源：
+
+        - **always 技能**：它们无条件进系统提示词，所以它们的 `tools:` 对每一轮都成立；
+        - **已启用插件**：清单一侧声明的 `tools:`。
+
+        ⚠️ 口径差异（如实记下）：**按 `$skill` 显式唤起**的技能不在这里——那一步拣选
+        发生在 `build_transcript` 的更下游，而钩子链必须在装配期就定下来。
+        所以「临时唤起一个带 `tools:` 的技能」这一轮不会收紧工具面。
+
+        **失败一律降级为空声明**（＝不施加约束）：声明是**作者的自律**，不是用户的
+        安全设置；读不到它不会绕过任何用户设置（Agent 白名单 / 执行模式 / 审批门
+        照旧由另外三道门守着）。反过来，一次读盘抖动就让整轮所有工具调用被拒，
+        那是把「可扩展」做成了「可宕机」。
+        """
+        root = workspace or self.workspace
+        declarations: list[ToolDeclaration] = []
+        try:
+            for name, raw in self.skills.declared_tools(self.skills.get_always_skills()):
+                declarations.append(
+                    ToolDeclaration(
+                        source=f"skill:{name}",
+                        tools=frozenset(parse_declared_tools(raw)),
+                    )
+                )
+        except Exception:
+            logger.warning("failed to read declared tools from skills", exc_info=True)
+        try:
+            # 局部导入：同上（模块级会把 `config.loader` 闭成环）
+            from nanobot.agent.plugins import plugin_tool_declarations
+
+            for name, tools in plugin_tool_declarations(root, self.user_plugins_dir):
+                declarations.append(
+                    ToolDeclaration(
+                        source=f"plugin:{name}",
+                        tools=frozenset(parse_declared_tools(tools)),
+                    )
+                )
+        except Exception:
+            logger.warning("failed to read declared tools from Agent Plugins", exc_info=True)
+        return combine_declarations(declarations)
+
     def build_system_prompt(
         self,
         *,
@@ -138,27 +262,37 @@ class ContextBuilder:
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         root = workspace or self.workspace
-        parts = [self._get_identity(channel=channel, workspace=root)]
+        # FR-3.10：插件片段挂载点在整个装配过程里共用一份（`plugin_prompt_mounts`
+        # 内部有缓存并按包指纹失效），不要在每个 render 调用点各取一次 ——
+        # 那样每轮要重复扫盘，而且两次取到的可能不是同一批（改动竞态）。
+        plugin_mounts = self._plugin_prompt_mounts(root)
+        parts = [
+            self._get_identity(channel=channel, workspace=root, plugin_mounts=plugin_mounts)
+        ]
 
         bootstrap = self._load_bootstrap_files(root)
         if bootstrap:
             parts.append(bootstrap)
 
         # [LOCAL PATCH] 传 workspace：主系统提示词可被 <workspace>/prompts/ 覆盖（§13.4）
-        parts.append(render_template("agent/tool_contract.md", override_root=root))
-
-        project_path = root.expanduser().resolve()
-        if project_path != self.workspace.expanduser().resolve():
-            parts.append(
-                "# Current Project\n\n"
-                f"Working directory: {project_path}\n"
-                "Use it as the default root for project files and relative tool paths."
+        parts.append(
+            render_template(
+                "agent/tool_contract.md",
+                override_root=root,
+                plugin_mounts=plugin_mounts,
             )
+        )
 
         if include_memory:
             memory = self.memory.read_memory()
             if memory and not self._is_template_content(memory, "memory/MEMORY.md"):
-                parts.append(f"# Memory\n\n## Long-term Memory\n{memory}")
+                # [LOCAL PATCH] 注入前作废记忆里对工作目录的断言（见
+                # `neutralize_stale_working_dir`）。记忆是模型写的、可能长期滞后的
+                # **旧事实**，而工作目录是运行时值——两者冲突时不能让记忆赢。
+                parts.append(
+                    "# Memory\n\n## Long-term Memory\n"
+                    f"{neutralize_stale_working_dir(memory)}"
+                )
 
         active_skills = self.skills.get_always_skills()
         if active_skills:
@@ -176,6 +310,7 @@ class ContextBuilder:
                     "agent/skills_section.md",
                     skills_summary=skills_summary,
                     override_root=root,
+                    plugin_mounts=plugin_mounts,
                 )
             )
 
@@ -186,9 +321,39 @@ class ContextBuilder:
                 f"{session_summary['text']}"
             )
 
+        # [LOCAL PATCH] 工作目录**无条件**、且**放在最后**写进提示词。
+        #
+        # 两条都是实测逼出来的，各自对应一种「设置里写着 A、文件落在 B」：
+        #
+        # 1) **无条件**。上游是 `if project_path != self.workspace: ...`——只在
+        #    「本次工作空间 ≠ 引擎自身工作空间」时才追加。于是「会话没绑工作空间」
+        #    和「绑的正好就是引擎默认那个」这两种情况下，提示词里**一个绝对路径
+        #    都没有**（identity.md 只有显式绑定时才给绝对路径），模型只能自己猜。
+        # 2) **放在最后**。此前它排在 `# Memory` **之前**，而长期记忆里恰好写着
+        #    `Current working directory: D:\test`。两条消息互相矛盾、后者在下方，
+        #    模型信了记忆（原话「根据之前的上下文，当前工作目录是 D:\test」）。
+        #    运行时值是这一轮才成立的**唯一**真相，必须压在最后、成为最新的陈述。
+        #
+        # 末句是冲着这个失败模式写的：模型会为「当前工作目录是哪儿」编依据，
+        # 而记忆是滞后的、可以被用户改的，工作目录只能以运行时为准。
+        project_path = root.expanduser().resolve()
+        parts.append(
+            "# Current Project\n\n"
+            f"Working directory: {project_path}\n"
+            "Use it as the default root for project files and relative tool paths. "
+            "This runtime value is the only source of truth for the working directory: "
+            "paths mentioned in memory, skills or earlier sessions are historical — "
+            "do not reuse them unless the user asks for them explicitly."
+        )
+
         return "\n\n---\n\n".join(parts)
 
-    def _get_identity(self, channel: str | None = None, workspace: Path | None = None) -> str:
+    def _get_identity(
+        self,
+        channel: str | None = None,
+        workspace: Path | None = None,
+        plugin_mounts: Sequence[PluginPromptMount] = (),
+    ) -> str:
         """Get the core identity section."""
         root = workspace or self.workspace
         workspace_path = str(root.expanduser().resolve())
@@ -201,10 +366,12 @@ class ContextBuilder:
             workspace_path=workspace_path,
             agent_workspace_path=agent_workspace_path,
             runtime=runtime,
+            plugin_mounts=plugin_mounts,
             platform_policy=render_template(
                 "agent/platform_policy.md",
                 system=system,
                 override_root=root,
+                plugin_mounts=plugin_mounts,
             ),
             channel=channel or "",
             override_root=root,

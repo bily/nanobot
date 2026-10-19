@@ -66,6 +66,17 @@ class DreamConfig(Base):
         validation_alias=AliasChoices("modelOverride", "model", "model_override"),
     )  # Model preset name for Dream sessions
 
+    # [LOCAL PATCH] FR-4.6：Dream 审查闸门开关。
+    #
+    # 默认 **开**：Dream 的合并产物先写 candidate 区（不直落 `MEMORY.md`/SOUL.md/USER.md），
+    # 等用户审查采纳后才写回。关掉则回到「直落」旧行为（与引入闸门前一致，便于回退）。
+    #
+    # 为什么必须默认开：Dream 是 cron 周期作业、无人值守，且它直接改写长期记忆这种
+    # **不可逆**的持久文件。没有闸门时一次跑偏的合并会静默污染 MEMORY.md，而修复只能靠
+    # `/dream-restore` 翻历史——那已经是事故后的补救。默认开把「模型提议」和「记忆生效」
+    # 两件事解耦，符合「不采纳 ⇒ MEMORY.md 逐字节不变」这条硬判据。
+    require_review: bool = True
+
     def build_schedule(self, timezone: str) -> CronSchedule:
         """Build the runtime schedule, preferring the legacy cron override if present."""
         if self.cron:
@@ -94,15 +105,66 @@ class InlineFallbackConfig(Base):
 FallbackCandidate = str | InlineFallbackConfig
 
 
+class ModelPricing(Base):
+    """[LOCAL PATCH] 模型单价，用于客户端「用量」分区的**金额**口径（FR-11.1）。
+
+    单位是**每百万 token**：供应商报价几乎都按这个量级，按单 token 报价会让输入框里
+    全是 `0.000002` 这种数字，肉眼分不出少打一位。
+
+    ## 为什么必须有 `cache_read_per_million`
+
+    引擎的用量表里 `input_tokens` 是**逻辑输入总量、已包含缓存读取**
+    （见 `nanobot/providers/base.py` 的 `LLMUsage`：*"``input_tokens`` is the logical
+    input total and therefore includes cache reads"*；Anthropic 侧写入处把
+    `input + cache_write + cache_read` 相加）。只按「输入 / 输出」两档计价，在长会话里
+    会严重高估——缓存命中的部分通常只按输入价的 ~10% 计费，而它往往占输入的绝大部分
+    （本机实测某份 trace：输入 1060 万、其中缓存 1048 万）。
+
+    `None` 的语义是「用户没填」→ 客户端按输入单价计（＝明确的保守上界），
+    **不是** 0。客户端不会替你假定一个折扣率：「编一个折扣率出来的数字比没有数字更糟」。
+
+    ## 刻意不做汇率
+
+    `currency` 只用于**分组展示**，客户端不会把两种币种的金额加到一起（那需要汇率来源，
+    本项目没有）。取值域用 `Literal` 而不是裸 `str`：手写 `"RMB"` / `"rmb"` 这类拼错
+    在裸 str 下会被静默接受，然后分组时就多出一行看不出问题的「另一种货币」。
+    """
+
+    input_per_million: float = 0.0
+    output_per_million: float = 0.0
+    cache_read_per_million: float | None = None
+    currency: Literal["CNY", "USD"] = "CNY"
+
+
 class ModelPresetConfig(Base):
     """A named set of model + generation parameters for quick switching."""
 
     model: str
     provider: str = "auto"
-    max_tokens: int = 8192
+    max_tokens: int = 32_768
     context_window_tokens: int = 200_000
     temperature: float = 0.1
     reasoning_effort: str | None = None
+
+    # [LOCAL PATCH] 模型能力声明（客户端「添加模型」对话框的「高级配置」）。
+    #
+    # 这四项是**声明式**字段：引擎当前不据此改变请求行为——工具定义始终随请求下发
+    # （`reasoning_effort` 才是唯一真的会改变请求的开关）。加它们的理由是让客户端
+    # 把「用户认定的模型能力」随预设一起落盘/回读/迁移，等引擎接入时不必再改
+    # 配置文件格式。**不要**因为「反正没人读」就删掉：删掉之后客户端写的键会被
+    # pydantic 静默忽略（`Base` 未开 extra="allow"），表现为「勾选了、保存了、
+    # 再打开又全没了」，且没有任何报错。
+    supports_tools: bool = True  # 该模型支持 function calling
+    supports_vision: bool = False  # 该模型接受图片输入
+    # 该模型有思考模式。默认 **True** 与 `supports_vision` 的默认值方向相反，这是
+    # 刻意的：客户端用它做**硬门禁**（关闭「注入思考强度」并给出原因），而门禁的
+    # 默认值一旦取保守方向，所有没勾过的历史预设都会一升级就被禁掉；取宽松方向，
+    # 只有用户**显式取消勾选**的预设才会被禁——那正是他表达意图的地方。
+    supports_reasoning: bool = True
+    custom_protocol: bool = False  # 端点不走标准 OpenAI 兼容协议
+
+    # 单价（FR-11.1 的金额口径）。`None` = 没配 → 客户端不把它计入金额合计。
+    pricing: ModelPricing | None = None
 
     def to_generation_settings(self) -> Any:
         from nanobot.providers.base import GenerationSettings
@@ -122,7 +184,7 @@ class AgentDefaults(Base):
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     )
-    max_tokens: int = 8192
+    max_tokens: int = 32_768
     context_window_tokens: int = 200_000
     context_block_limit: int | None = None
     temperature: float = 0.1
